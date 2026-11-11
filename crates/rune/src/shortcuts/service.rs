@@ -2,7 +2,9 @@ use super::{Shortcut, ShortcutError, ShortcutId, Sink, NativeBackend};
 #[cfg(test)]
 use super::Backend;
 use crate::{Tx, app::Shared, runtime::Waker};
-use handlers::{Handlers, HostId, HostIds};
+use handlers::{HostId, HostIds, Table};
+#[cfg(test)]
+use handlers::Handlers;
 use machine::{AttachEffect, AttachEvent, Attachment, BindEffect, BindEvent, Bindings, step_attachment, step_bindings};
 use std::{collections::HashMap, rc::Rc, sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU32, Ordering}}};
 #[cfg(not(target_os = "linux"))]
@@ -46,7 +48,7 @@ struct Control {
 pub(crate) struct Hub<S> {
     control: Arc<Control>,
     pending: Mutex<Vec<Pending<S>>>,
-    handlers: Arc<Mutex<Handlers<Handler<S>>>>,
+    handlers: Arc<Table<Handler<S>>>,
     errors: Mutex<Vec<ShortcutError>>,
     title: OnceLock<&'static str>,
     unmodified: AtomicBool,
@@ -221,9 +223,8 @@ impl<S: 'static> Hub<S> {
         let handlers = self.handlers.clone();
         let routed: Routed = Box::new(move |host| handlers.lock().unwrap().routed(id, host));
         if let Err(e) = self.control.invoke_routed(routed, move |engine| engine.register(id, shortcut)) {
-            // Out from under the lock before it drops: its captures may take routing.
-            let removed = self.handlers.lock().unwrap().remove(id);
-            drop(removed);
+            // Dropped outside the lock, since its captures may take routing.
+            self.handlers.remove(id);
             return Err(e);
         }
         Ok(id)
@@ -233,9 +234,8 @@ impl<S: 'static> Hub<S> {
         let handlers = self.handlers.clone();
         self.control.invoke(move |engine| {
             engine.unregister(id)?;
-            let removed = handlers.lock().unwrap().remove(id);
-            // On the thread running the call, but after the handler lock.
-            drop(removed);
+            // On the thread running the call, but outside the handler lock.
+            handlers.remove(id);
             Ok(())
         })
     }
@@ -305,11 +305,7 @@ impl Guard {
             step_attachment(&mut route.state, AttachEvent::Attach { owner: std::thread::current().id(), wake });
         }
         let handlers = shared.shortcuts.handlers.clone();
-        let cleanup = move |latest, released: Vec<ShortcutId>| {
-            let removed = handlers.lock().unwrap().close(latest, &released);
-            // Out from under the lock before they drop: their captures may take routing.
-            drop(removed);
-        };
+        let cleanup = move |latest, released: Vec<ShortcutId>| handlers.close(latest, &released);
         let guard = Self { control, cleanup: Some(Box::new(cleanup)), _thread: std::marker::PhantomData };
         for (shortcut, handler) in std::mem::take(&mut *shared.shortcuts.pending.lock().unwrap()) {
             if let Err(error) = shortcut.and_then(|s| shared.shortcuts.register(s, handler)) {

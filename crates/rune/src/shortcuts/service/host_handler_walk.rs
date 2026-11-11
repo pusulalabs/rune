@@ -3,7 +3,10 @@
 //! engine in place and then waits for routing. A close takes routing, then the engine (on Linux
 //! under the slot's lock, which it holds until it has the engine's), then cleans up. A
 //! registration reserves its id and handler, is routed, then reaches an engine; a caller whose
-//! queued call a close let go finishes on its own thread, later.
+//! queued call a close let go finishes on its own thread, later. A refused caller takes its
+//! handler out, drops it, then returns: on dev under the handler lock, which a close waits for;
+//! on the new side outside it, with a close waiting for the drop. A close takes and drops the
+//! handlers it ends in one step, since nothing else drops while it waits for a running drop.
 //!
 //! Three sides play each sequence: the code on dev, that code with the marked departure, and the
 //! new code, whose handlers are the production `Handlers` and `HostIds`. All three route through
@@ -25,6 +28,7 @@ const KEPT_EARLIER: &str = "a cleanup kept a handler routed before its close too
 const KEPT_RELEASED: &str = "a cleanup kept the handler of a registration its close released";
 const LOST_LIVE: &str = "the attached host's engine holds a registration with no handler";
 const LEAKED: &str = "a handler outlived both hosts";
+const CAPTURE_OUTLIVES_CLOSE: &str = "a close returned while a handler it ends was still dropping";
 const KEEPS_LATER: &str = "a cleanup kept a later host's handlers";
 const REFUSED_CLOSED: &str = "a bind reaching an engine a close took was refused";
 
@@ -58,6 +62,8 @@ enum Phase {
     Queued,
     /// A close let its queued call go; the caller hasn't seen NotRunning yet.
     LetGo,
+    /// Refused, it took its handler out and is dropping it before it returns NotRunning.
+    Dropping,
     /// On its way into `engine`, holding its lock when `locked`.
     Routed { engine: usize, locked: bool },
 }
@@ -142,10 +148,6 @@ impl World {
 
     fn has_handler(&self, id: u32) -> bool {
         if self.side == Side::New { self.table.contains_key(&ShortcutId(id)) } else { self.ids.contains(&id) }
-    }
-
-    fn remove_handler(&mut self, id: u32) {
-        if self.side == Side::New { let _ = self.table.remove(ShortcutId(id)); } else { self.ids.remove(&id); }
     }
 
     fn routing_held(&self) -> bool { matches!(self.call, Phase::Parked(_) | Phase::SlotWait) }
@@ -235,13 +237,14 @@ impl World {
             Side::Reference => self.ids.retain(|id| !ends(id)),
             Side::New => {
                 let released: Vec<ShortcutId> = (0..64).filter(|id| in_mask(released, *id)).map(ShortcutId).collect();
-                let _ = self.table.close(latest, &released);
+                for (id, _) in self.table.close(latest, &released) { self.table.dropped(id); }
             }
         }
         let after = self.handler_ids();
         if before.difference(&after).any(|id| !ends(id)) { self.broken.push(DROPPED_LATER); }
         if after.iter().any(routed_before) { self.broken.push(KEPT_EARLIER); }
         if after.iter().any(|id| in_mask(released, *id)) { self.broken.push(KEPT_RELEASED); }
+        if self.call == Phase::Dropping && ends(&self.id) { self.broken.push(CAPTURE_OUTLIVES_CLOSE); }
         if before.iter().any(|id| in_mask(released, *id) && !routed_before(id)) { self.released_later = true; }
         let expected: BTreeSet<u32> = before.iter().copied().filter(|id| !ends(id)).collect();
         if !expected.is_empty() { self.departure = Some(KEEPS_LATER); }
@@ -256,11 +259,23 @@ impl World {
         self.result = None;
     }
 
+    /// Refused: the caller takes its handler out, if it is still there, to drop it.
     fn refuse(&mut self) {
         self.occupied = None;
-        self.remove_handler(self.id);
+        let taken = if self.side == Side::New { self.table.take(ShortcutId(self.id)).is_some() } else { self.ids.remove(&self.id) };
+        if taken { self.call = Phase::Dropping } else { self.finish_refusal() }
+    }
+
+    fn finish_refusal(&mut self) {
+        if self.side == Side::New { self.table.dropped(ShortcutId(self.id)); }
         self.call = Phase::Idle;
         self.result = Some(Err(ShortcutError::NotRunning));
+    }
+
+    /// A close waits for a running drop: on dev for the handler lock, on the new side for the
+    /// table to say nothing is taken.
+    fn cleanup_waits(&self) -> bool {
+        if self.side == Side::New { self.table.busy() } else { self.call == Phase::Dropping }
     }
 
     /// Routing hands the call to the latest host.
@@ -354,7 +369,8 @@ impl World {
     /// routing, lets go of the engine, cleans up; 5, 6, 7 the same for B; 8 reserve an id and
     /// handler; 9 route it from another thread; 10 route it from the attached host's thread; 11
     /// it reaches its engine, or a let-go caller sees NotRunning; 12, 13 A or B drains; 14, 15
-    /// another call enters an engine and leaves; 16 a waiting call takes the slot or the engine.
+    /// another call enters an engine and leaves; 16 a waiting call takes the slot or the engine;
+    /// 17 a refused caller's handler finishes dropping.
     /// Returns whether the letter did anything.
     fn play(&mut self, letter: usize) -> bool {
         self.kept = None;
@@ -368,7 +384,7 @@ impl World {
             1 if self.lives[B] == Life::Installed && !self.routing_held() => { self.attach(B); true }
             2 | 5 if self.lives[host] == Life::Attached && !self.routing_held() => { self.close_routing(host); true }
             3 | 6 if matches!(self.lives[host], Life::Closing { .. }) => self.release_engine(host),
-            4 | 7 if matches!(self.lives[host], Life::Released { .. }) => { self.cleanup(host); true }
+            4 | 7 if matches!(self.lives[host], Life::Released { .. }) && !self.cleanup_waits() => { self.cleanup(host); true }
             8 if self.call == Phase::Idle => { self.reserve(); true }
             9 if self.call == Phase::Reserved => { self.route(OTHER); true }
             10 if self.call == Phase::Reserved && !self.linux => { self.route(self.owner().unwrap_or(OTHER)); true }
@@ -383,6 +399,7 @@ impl World {
                 true
             }
             15 if self.busy.is_some() => { self.busy = None; true }
+            17 if self.call == Phase::Dropping => { self.finish_refusal(); true }
             16 => match self.call {
                 Phase::SlotWait if !self.slot_held() => { self.take_slot(); true }
                 Phase::Parked(engine) if !self.locked(engine) => { self.call = Phase::Routed { engine, locked: true }; true }
@@ -411,18 +428,23 @@ fn without_handlers(view: View) -> View {
     (call, result, lives, owner, jobs, live, busy, vec![], vec![])
 }
 
-struct Walk { found: BTreeSet<&'static str>, departures: BTreeSet<&'static str>, released_later: bool }
+struct Walk { found: BTreeSet<&'static str>, departures: BTreeSet<&'static str>, released_later: bool, sequences: usize, waited: bool }
 
 fn walk(sides: &[World; 3], departed: bool, sequence: &mut Vec<usize>, depth: usize, out: &mut Walk) {
-    for letter in 0..17 {
+    for letter in 0..18 {
         let mut next = sides.clone();
+        let waits = next[2].lives.iter().any(|life| matches!(life, Life::Released { .. })) && next[2].cleanup_waits();
         let moved = next.each_mut().map(|world| world.play(letter));
-        assert!(moved.iter().all(|m| *m == moved[0]), "{sequence:?} + {letter}: sides disagree on what can happen");
-        if !moved[0] { continue; }
+        assert!(next[2].broken.is_empty(), "{:?}: linux {}, {sequence:?} + {letter}", next[2].broken, next[2].linux);
+        // Past a departure, dev can be where the others aren't; the reference and new code never.
+        assert_eq!(moved[1], moved[2], "{sequence:?} + {letter}: the reference and new code disagree on what can happen");
+        assert!(departed || moved[0] == moved[1], "{sequence:?} + {letter}: dev and the reference disagree on what can happen");
+        if !moved[1] { continue; }
         sequence.push(letter);
+        out.sequences += 1;
+        out.waited |= waits;
         let [dev, reference, new] = &next;
         let at = || format!("linux {}, {sequence:?}", new.linux);
-        assert!(new.broken.is_empty(), "{:?}: {}", new.broken, at());
         assert!(reference.broken.is_empty(), "reference {:?}: {}", reference.broken, at());
         out.found.extend(dev.broken.iter().copied());
         out.released_later |= new.released_later;
@@ -441,7 +463,8 @@ fn walk(sides: &[World; 3], departed: bool, sequence: &mut Vec<usize>, depth: us
                 }
                 Some(REFUSED_CLOSED) => {
                     // The bind is refused, and its handler goes, where dev returned Ok.
-                    assert_eq!((dev.result.clone(), reference.result.clone()), (Some(Ok(())), Some(Err(ShortcutError::NotRunning))), "{}", at());
+                    assert_eq!(dev.result, Some(Ok(())), "{}", at());
+                    assert!(reference.call == Phase::Dropping || reference.result == Some(Err(ShortcutError::NotRunning)), "{}", at());
                     let (_, _, lives, owner, jobs, live, busy, _, _) = reference.view();
                     let (_, _, dev_lives, dev_owner, dev_jobs, dev_live, dev_busy, _, _) = dev.view();
                     assert_eq!((lives, owner, jobs, live, busy), (dev_lives, dev_owner, dev_jobs, dev_live, dev_busy), "{}", at());
@@ -461,7 +484,7 @@ fn walk(sides: &[World; 3], departed: bool, sequence: &mut Vec<usize>, depth: us
 fn every_interleaving_keeps_handlers_with_the_hosts_that_took_them() {
     for linux in [true, false] {
         let sides = [Side::Dev, Side::Reference, Side::New].map(|side| World::new(side, linux));
-        let mut out = Walk { found: BTreeSet::new(), departures: BTreeSet::new(), released_later: false };
+        let mut out = Walk { found: BTreeSet::new(), departures: BTreeSet::new(), released_later: false, sequences: 0, waited: false };
         walk(&sides, false, &mut vec![], 8, &mut out);
         for invariant in [DROPPED_LATER, LOST_LIVE] {
             assert!(out.found.contains(invariant), "linux {linux}: the walk never saw dev break this, so it proves nothing: {invariant}");
@@ -476,6 +499,8 @@ fn every_interleaving_keeps_handlers_with_the_hosts_that_took_them() {
             walk(&sides, false, &mut prefix.clone(), prefix.len() + 7, &mut out);
             assert!(out.departures.contains(REFUSED_CLOSED), "the refused-bind departure never took effect");
         }
+        assert!(out.waited, "linux {linux}: no close ever had to wait for a refused caller's drop");
+        eprintln!("linux {linux}: {} sequences", out.sequences);
         if linux { assert!(out.released_later, "the walk never had a close release a later host's registration"); }
     }
 }
@@ -513,7 +538,7 @@ fn a_close_waiting_for_a_busy_engine_keeps_the_slot_locked() {
         assert_eq!(world.call, Phase::SlotWait, "{side:?}: a registration holds routing, waiting for the slot");
         assert!(!world.play(5) && !world.play(16), "{side:?}: so B can't close, and the registration can't go on");
         assert!(world.play(15) && world.play(3), "{side:?}: the call inside leaves and the close releases B's engine");
-        assert!(world.play(16), "{side:?}");
+        assert!(world.play(16) && world.play(17), "{side:?}");
         assert_eq!(world.result, Some(Err(ShortcutError::NotRunning)), "{side:?}: the slot is empty by then");
     }
 }
@@ -525,7 +550,7 @@ fn a_caller_let_go_by_a_close_finishes_after_it() {
         // A registration from another thread queues for A, then A's close lets it go.
         for letter in [8, 9, 2] { assert!(world.play(letter)); }
         assert_eq!((world.call, world.result.clone()), (Phase::LetGo, None), "{side:?}: the caller hasn't run yet");
-        assert!(world.play(11));
+        assert!(world.play(11) && world.play(17));
         assert_eq!((world.call, world.result.clone()), (Phase::Idle, Some(Err(ShortcutError::NotRunning))), "{side:?}");
         assert!(!world.has_handler(1), "{side:?}");
     }
@@ -551,7 +576,21 @@ fn a_bind_reaching_an_engine_a_close_took_is_refused() {
     // behind it; A's close takes B's engine and releases it first.
     for letter in [2, 0, 1, 14, 8, 9] { assert!(world.play(letter)); }
     assert_eq!(world.call, Phase::Parked(1));
-    for letter in [3, 15, 3, 16, 11] { assert!(world.play(letter), "{letter}"); }
+    for letter in [3, 15, 3, 16, 11, 17] { assert!(world.play(letter), "{letter}"); }
     assert_eq!(world.result, Some(Err(ShortcutError::NotRunning)));
     assert!(!world.has_handler(1), "its handler went with it");
+}
+
+#[test]
+fn a_close_waits_for_a_refused_callers_drop() {
+    for side in [Side::Dev, Side::New] {
+        let mut world = World::new(side, false);
+        // A registration queues for A; A's close cancels it and lets go of its engine.
+        for letter in [8, 9, 2, 3] { assert!(world.play(letter)); }
+        // The caller takes its handler out and starts dropping it.
+        assert!(world.play(11));
+        assert_eq!(world.call, Phase::Dropping);
+        assert!(!world.play(4), "{side:?}: the close can't finish while the handler drops");
+        assert!(world.play(17) && world.play(4), "{side:?}");
+    }
 }

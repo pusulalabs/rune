@@ -281,3 +281,65 @@ fn an_unregister_from_another_thread_drops_the_handler_on_the_owner() {
     assert_eq!(*dropped_on.lock().unwrap(), Some(std::thread::current().id()), "the capture dropped on the owner, which ran the call");
     drop(guard);
 }
+
+/// A capture that, when dropped, says so and waits to be let go.
+struct PausesOnDrop { dropping: mpsc::Sender<()>, resume: Mutex<mpsc::Receiver<()>> }
+
+impl Drop for PausesOnDrop {
+    fn drop(&mut self) {
+        let _ = self.dropping.send(());
+        let _ = self.resume.lock().unwrap().recv();
+    }
+}
+
+#[test]
+fn a_close_returns_only_once_a_refused_callers_handler_has_dropped() {
+    let app = app("Dropping");
+    let chord = chord("ctrl+alt+k");
+    // The host runs on its own thread, closing in two halves when told.
+    let (ready, is_ready) = mpsc::channel();
+    let (step, steps) = mpsc::channel::<()>();
+    let (closed, is_closed) = mpsc::channel();
+    let host = {
+        let (shared, handle, chord) = (app.shared.clone(), app.handle(), chord.clone());
+        std::thread::spawn(move || {
+            let woke = Mutex::new(ready.clone());
+            let mut guard = std::mem::ManuallyDrop::new(Guard::attach(&shared, Arc::new(move || { let _ = woke.lock().unwrap().send(()); }), true, false));
+            // On Linux the caller's duplicate is refused outright.
+            if cfg!(target_os = "linux") { handle.register_shortcut(chord, |_, _| {}).unwrap(); }
+            ready.send(()).unwrap();
+            steps.recv().unwrap();
+            let latest = guard.close_routing();
+            steps.recv().unwrap();
+            guard.finish_close(latest);
+            closed.send(()).unwrap();
+        })
+    };
+    is_ready.recv().unwrap();
+    while is_ready.try_recv().is_ok() {}
+
+    let (dropping, is_dropping) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let probe = PausesOnDrop { dropping, resume: Mutex::new(resumed) };
+    let caller = {
+        let handle = app.handle();
+        std::thread::spawn(move || handle.register_shortcut(chord, move |_, _| { let _ = &probe; }))
+    };
+    if cfg!(not(target_os = "linux")) {
+        // Elsewhere the call queues for the host, and the close cancels it.
+        is_ready.recv().unwrap();
+        step.send(()).unwrap();
+    }
+    // The caller has taken its handler out and is dropping it.
+    is_dropping.recv().unwrap();
+    if cfg!(target_os = "linux") { step.send(()).unwrap(); }
+    step.send(()).unwrap();
+    let early = is_closed.recv_timeout(std::time::Duration::from_millis(300));
+    resume.send(()).unwrap();
+    let returned = is_closed.recv_timeout(std::time::Duration::from_secs(30));
+    let answer = caller.join().unwrap();
+    host.join().unwrap();
+    assert!(early.is_err(), "the close returned while the handler it cleared was still dropping");
+    assert!(returned.is_ok(), "the close returns once it has dropped");
+    assert!(answer.is_err(), "{answer:?}");
+}
