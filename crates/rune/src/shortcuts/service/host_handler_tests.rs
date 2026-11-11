@@ -33,10 +33,10 @@ impl Host {
             attached.send(()).unwrap();
             closes.recv().unwrap();
             let cleanup = guard.cleanup.take().unwrap();
-            guard.cleanup = Some(Box::new(move |latest| {
+            guard.cleanup = Some(Box::new(move |latest, released| {
                 entered_tx.send(()).unwrap();
                 resumed.recv().unwrap();
-                cleanup(latest);
+                cleanup(latest, released);
             }));
             drop(guard);
         });
@@ -70,7 +70,7 @@ fn a_closing_host_leaves_a_later_hosts_handlers_alone() {
     let id = handle.register_shortcut(chord("ctrl+alt+h"), |state, _| *state += 1).unwrap();
     first.finish();
 
-    assert_eq!(app.shared.shortcuts.handlers.lock().unwrap().keys().copied().collect::<Vec<_>>(), [id], "only the closed host's handler went");
+    assert_eq!(app.shared.shortcuts.handlers.lock().unwrap().ids(), [id], "only the closed host's handler went");
     app.shared.shortcuts.fire(&chord("ctrl+alt+h")).unwrap();
     assert_eq!(deliver(&app), 1, "the later host's shortcut still reaches its handler");
     drop(guard);
@@ -127,4 +127,84 @@ fn an_unrouted_registration_outlives_a_close_and_goes_when_refused() {
     assert!(app.shared.shortcuts.handlers.lock().unwrap().contains_key(&id), "no host had it, so no close takes it");
     assert_eq!(app.shared.shortcuts.bind(id, chord("ctrl+alt+u")), Err(ShortcutError::NotRunning));
     assert!(app.shared.shortcuts.handlers.lock().unwrap().is_empty(), "refused, it goes with its registration");
+}
+
+#[test]
+fn a_close_that_releases_a_later_hosts_engine_runs_none_of_its_callbacks() {
+    let app = app("Released");
+    let handle = app.handle();
+    // A's close takes routing; before it lets go of its engine, B attaches, registers and fires.
+    let mut first = std::mem::ManuallyDrop::new(Guard::attach(&app.shared, Arc::new(|| {}), true, false));
+    let latest = first.close_routing();
+    let second = Guard::attach(&app.shared, Arc::new(|| {}), true, false);
+    handle.register_shortcut(chord("ctrl+alt+x"), |state, _| *state += 1).unwrap();
+    app.shared.shortcuts.fire(&chord("ctrl+alt+x")).unwrap();
+    // The engine A lets go of is B's (in the slot, or this thread's), and with it B's registration.
+    first.finish_close(latest);
+    assert!(app.shared.shortcuts.handlers.lock().unwrap().is_empty(), "the released registration's handler went");
+    assert_eq!(deliver(&app), 0, "its queued activation runs nothing");
+    drop(second);
+}
+
+#[test]
+fn host_order_holds_past_u32_max() {
+    let app = app("Rollover");
+    let handle = app.handle();
+    app.shared.shortcuts.control.attachment.lock().unwrap().hosts = HostIds::after(u64::from(u32::MAX) - 1);
+    let first = Guard::attach(&app.shared, Arc::new(|| {}), true, false);
+    handle.register_shortcut(chord("ctrl+alt+m"), |state, _| *state += 1).unwrap();
+    app.shared.shortcuts.fire(&chord("ctrl+alt+m")).unwrap();
+    // B is the host after u32::MAX; closing it ends A, which attached before it.
+    drop(Guard::attach(&app.shared, Arc::new(|| {}), true, false));
+    assert_eq!(deliver(&app), 0, "A's activation runs nothing once the service is closed");
+    drop(first);
+}
+
+/// A handler capture whose drop asks who holds a chord, which takes routing.
+struct AsksOnDrop { handle: AppHandle<u32>, dropping: mpsc::Sender<()> }
+
+impl Drop for AsksOnDrop {
+    fn drop(&mut self) {
+        let _ = self.dropping.send(());
+        // Long enough for the other registration to take routing and reach the handlers.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = self.handle.shortcut_owner(&chord("ctrl+alt+q"));
+    }
+}
+
+// Elsewhere a call from another thread waits for the owner rather than taking the handlers.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_handler_drops_after_the_handler_lock_so_routing_can_proceed() {
+    let app = app("Drops");
+    let handle = app.handle();
+    let guard = Guard::attach(&app.shared, Arc::new(|| {}), true, false);
+    handle.register_shortcut(chord("ctrl+alt+d"), |_, _| {}).unwrap();
+    // Reserved now, routed while the refused handler drops.
+    let waiting = app.shared.shortcuts.reserve(Arc::new(|_: &mut u32, _: &mut Tx| {})).unwrap();
+
+    let (done, finished) = mpsc::channel();
+    let (dropping, is_dropping) = mpsc::channel();
+    let refused = {
+        let (handle, done) = (handle.clone(), done.clone());
+        std::thread::spawn(move || {
+            let probe = AsksOnDrop { handle: handle.clone(), dropping };
+            let result = handle.register_shortcut(chord("ctrl+alt+d"), move |_, _| { let _ = &probe; });
+            done.send(("refused", result == Err(ShortcutError::Conflict))).unwrap();
+        })
+    };
+    is_dropping.recv().unwrap();
+    let routed = {
+        let shared = app.shared.clone();
+        std::thread::spawn(move || done.send(("routed", shared.shortcuts.bind(waiting, chord("ctrl+alt+w")).is_ok())).unwrap())
+    };
+    let results: Vec<_> = (0..2).map(|_| finished.recv_timeout(std::time::Duration::from_secs(30))).collect();
+    if !results.iter().all(|result| matches!(result, Ok((_, true)))) {
+        // Closing would wait on the deadlocked routing too, so the test leaves them be to fail.
+        std::mem::forget((guard, app));
+        panic!("{results:?}: the two deadlocked");
+    }
+    refused.join().unwrap();
+    routed.join().unwrap();
+    drop(guard);
 }

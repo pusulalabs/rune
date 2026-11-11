@@ -88,6 +88,12 @@ pub(super) enum Bindings<N> {
 
 impl<N> Bindings<N> {
     /// The registration of `shortcut`, if this engine holds one.
+    /// Every registration this engine holds.
+    pub(super) fn ids(&self) -> Vec<ShortcutId> {
+        let (Self::Virtual(registrations) | Self::Connected { registrations, .. }) = self else { return Vec::new() };
+        registrations.keys().copied().collect()
+    }
+
     pub(super) fn find(&self, shortcut: &Shortcut) -> Option<ShortcutId> {
         let (Self::Virtual(registrations) | Self::Connected { registrations, .. }) = self else { return None };
         find(registrations, shortcut)

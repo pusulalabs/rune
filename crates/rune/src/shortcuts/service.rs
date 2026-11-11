@@ -1,7 +1,8 @@
 use super::{Shortcut, ShortcutError, ShortcutId, Sink, NativeBackend};
 #[cfg(test)]
 use super::Backend;
-use crate::{Tx, app::Shared, machine::{Attempt, Seq}, runtime::Waker};
+use crate::{Tx, app::Shared, runtime::Waker};
+use handlers::{Handlers, HostId, HostIds};
 use machine::{AttachEffect, AttachEvent, Attachment, BindEffect, BindEvent, Bindings, step_attachment, step_bindings};
 use std::{collections::HashMap, rc::Rc, sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU32, Ordering}}};
 #[cfg(not(target_os = "linux"))]
@@ -11,14 +12,12 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(any(test, not(target_os = "linux")))]
 use std::sync::mpsc;
 
+mod handlers;
 mod machine;
 
 type Handler<S> = Arc<dyn Fn(&mut S, &mut Tx) + Send + Sync>;
-/// A handler and the host that accepted its registration, which is None until the
-/// registration is routed to one.
-type Entry<S> = (Option<Attempt>, Handler<S>);
 /// Called under the routing lock with the host a call is routed to.
-type Routed = Box<dyn FnOnce(Attempt) + Send>;
+type Routed = Box<dyn FnOnce(HostId) + Send>;
 type Pending<S> = (Result<Shortcut, ShortcutError>, Handler<S>);
 /// A call waiting for the owner thread: told its host when a drain takes it, then run.
 #[cfg(not(target_os = "linux"))]
@@ -34,7 +33,7 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 static NATIVE: Mutex<Vec<(ShortcutId, Shortcut, &'static str)>> = Mutex::new(Vec::new());
 
 /// The attachment, and the hosts it has had: each attach is a new host, the latest one.
-struct Routing { state: Attachment<Job>, hosts: Seq }
+struct Routing { state: Attachment<Job>, hosts: HostIds }
 
 struct Control {
     #[cfg(not(target_os = "linux"))]
@@ -47,7 +46,7 @@ struct Control {
 pub(crate) struct Hub<S> {
     control: Arc<Control>,
     pending: Mutex<Vec<Pending<S>>>,
-    handlers: Arc<Mutex<HashMap<ShortcutId, Entry<S>>>>,
+    handlers: Arc<Mutex<Handlers<Handler<S>>>>,
     errors: Mutex<Vec<ShortcutError>>,
     title: OnceLock<&'static str>,
     unmodified: AtomicBool,
@@ -59,7 +58,7 @@ impl<S> Default for Hub<S> {
             control: Arc::new(Control {
                 #[cfg(not(target_os = "linux"))]
                 key: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
-                attachment: Mutex::new(Routing { state: Attachment::Detached, hosts: Seq::default() }),
+                attachment: Mutex::new(Routing { state: Attachment::Detached, hosts: HostIds::default() }),
                 #[cfg(target_os = "linux")]
                 engine: Mutex::default(),
             }),
@@ -158,7 +157,7 @@ impl Control {
         {
             let Some(AttachEffect::Run { wake }) = effect else { return Err(ShortcutError::NotRunning) };
             let shared = self.engine.lock().unwrap().clone().ok_or(ShortcutError::NotRunning)?;
-            routed(route.hosts.current());
+            routed(route.hosts.latest());
             // Acquire the engine before releasing routing, so shutdown cannot race a new call.
             let mut engine = shared.lock().unwrap();
             drop(route);
@@ -172,7 +171,7 @@ impl Control {
         #[cfg(not(target_os = "linux"))]
         match effect {
             Some(AttachEffect::Run { wake }) => {
-                routed(route.hosts.current());
+                routed(route.hosts.latest());
                 drop(route);
                 let engine = ENGINES.with(|engines| engines.borrow().get(&self.key).cloned()).ok_or(ShortcutError::NotRunning)?;
                 let result = f(&mut engine.borrow_mut());
@@ -207,18 +206,19 @@ impl<S: 'static> Hub<S> {
     fn reserve(&self, handler: Handler<S>) -> Result<ShortcutId, ShortcutError> {
         let id = NEXT_ID.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map(ShortcutId).map_err(|_| ShortcutError::Backend("shortcut id space exhausted".into()))?;
-        self.handlers.lock().unwrap().insert(id, (None, handler));
+        let replaced = self.handlers.lock().unwrap().reserve(id, handler);
+        drop(replaced);
         Ok(id)
     }
 
     /// Registers a reserved id, recording the host that takes it.
     fn bind(&self, id: ShortcutId, shortcut: Shortcut) -> Result<ShortcutId, ShortcutError> {
         let handlers = self.handlers.clone();
-        let routed: Routed = Box::new(move |host| {
-            if let Some(entry) = handlers.lock().unwrap().get_mut(&id) { entry.0 = Some(host); }
-        });
+        let routed: Routed = Box::new(move |host| handlers.lock().unwrap().routed(id, host));
         if let Err(e) = self.control.invoke_routed(routed, move |engine| engine.register(id, shortcut)) {
-            self.handlers.lock().unwrap().remove(&id);
+            // Out from under the lock before it drops: its captures may take routing.
+            let removed = self.handlers.lock().unwrap().remove(id);
+            drop(removed);
             return Err(e);
         }
         Ok(id)
@@ -228,9 +228,11 @@ impl<S: 'static> Hub<S> {
         let handlers = self.handlers.clone();
         self.control.invoke(move |engine| {
             engine.unregister(id)?;
-            handlers.lock().unwrap().remove(&id);
-            Ok(())
+            let removed = handlers.lock().unwrap().remove(id);
+            Ok(removed)
         })
+        // Dropped outside the engine and handler locks, since its captures may take either.
+        .map(drop)
     }
 
     pub(super) fn errors(&self) -> Vec<ShortcutError> { std::mem::take(&mut self.errors.lock().unwrap()) }
@@ -257,8 +259,8 @@ impl<S: 'static> Hub<S> {
 /// Owned by the host, not AppHandle: closing/dropping the app releases native registrations.
 pub(crate) struct Guard {
     control: Arc<Control>,
-    /// Told the latest host when the close took routing.
-    cleanup: Option<Box<dyn FnOnce(Attempt)>>,
+    /// Told the latest host when the close took routing, and what the engine it let go of held.
+    cleanup: Option<Box<dyn FnOnce(HostId, Vec<ShortcutId>)>>,
     // The guard must be destroyed on the owning event-loop thread.
     _thread: std::marker::PhantomData<Rc<()>>,
 }
@@ -274,7 +276,7 @@ impl Guard {
             if let Some(shared) = weak.upgrade() {
                 let weak = Arc::downgrade(&shared);
                 crate::AppHandle { shared }.update(move |state, tx| {
-                    let handler = weak.upgrade().and_then(|s| s.shortcuts.handlers.lock().unwrap().get(&id).map(|(_, handler)| handler.clone()));
+                    let handler = weak.upgrade().and_then(|s| s.shortcuts.handlers.lock().unwrap().handler(id));
                     if let Some(handler) = handler {
                         tx.shortcut_activation_token = token;
                         handler(state, tx);
@@ -294,13 +296,15 @@ impl Guard {
         { *control.engine.lock().unwrap() = Some(Arc::new(Mutex::new(engine))); }
         {
             let mut route = control.attachment.lock().unwrap();
-            route.hosts.next();
+            route.hosts.attach();
             step_attachment(&mut route.state, AttachEvent::Attach { owner: std::thread::current().id(), wake });
         }
         let handlers = shared.shortcuts.handlers.clone();
-        // Every host up to the latest when this close took routing goes with it. A host that
-        // attached since keeps its handlers, as does a registration not yet routed.
-        let cleanup = move |closed: Attempt| handlers.lock().unwrap().retain(|_, (host, _)| host.is_none_or(|host| host > closed));
+        let cleanup = move |latest, released: Vec<ShortcutId>| {
+            let removed = handlers.lock().unwrap().close(latest, &released);
+            // Out from under the lock before they drop: their captures may take routing.
+            drop(removed);
+        };
         let guard = Self { control, cleanup: Some(Box::new(cleanup)), _thread: std::marker::PhantomData };
         for (shortcut, handler) in std::mem::take(&mut *shared.shortcuts.pending.lock().unwrap()) {
             if let Err(error) = shortcut.and_then(|s| shared.shortcuts.register(s, handler)) {
@@ -318,7 +322,7 @@ impl Guard {
                 let mut route = self.control.attachment.lock().unwrap();
                 let drained = step_attachment(&mut route.state, AttachEvent::Drain);
                 let Some(AttachEffect::Jobs(jobs)) = drained.into_iter().next() else { return };
-                let host = route.hosts.current();
+                let host = route.hosts.latest();
                 jobs.into_iter().map(|job| { (job.routed)(host); job.run }).collect()
             };
             let engine = ENGINES.with(|engines| engines.borrow().get(&self.control.key).cloned());
@@ -327,23 +331,44 @@ impl Guard {
     }
 }
 
-impl Drop for Guard {
-    fn drop(&mut self) {
+impl Guard {
+    /// The first half of a close: takes routing and lets waiting callers go. Returns the latest
+    /// host then.
+    fn close_routing(&self) -> HostId {
         let (effects, latest) = {
             let mut route = self.control.attachment.lock().unwrap();
-            (step_attachment(&mut route.state, AttachEvent::Close), route.hosts.current())
+            (step_attachment(&mut route.state, AttachEvent::Close), route.hosts.latest())
         };
         // Dropping queued reply senders releases waiting callers with NotRunning.
         for effect in effects { if let AttachEffect::Release(jobs) = effect { drop(jobs); } }
+        latest
+    }
+
+    /// The second half: lets go of the engine, then of the handlers the close ends.
+    fn finish_close(&mut self, latest: HostId) {
         #[cfg(not(target_os = "linux"))]
-        ENGINES.with(|engines| engines.borrow_mut().remove(&self.control.key));
+        let released = ENGINES.with(|engines| {
+            let engine = engines.borrow_mut().remove(&self.control.key);
+            engine.map_or_else(Vec::new, |engine| engine.borrow().bindings.ids())
+        });
         // The slot stays locked through the release, so a new host can't start while this one's
         // backend still holds its chords.
         #[cfg(target_os = "linux")]
+        let mut released = Vec::new();
+        #[cfg(target_os = "linux")]
         if let Some(engine) = self.control.engine.lock().unwrap().take() {
-            engine.lock().unwrap().release();
+            let mut engine = engine.lock().unwrap();
+            released = engine.bindings.ids();
+            engine.release();
         }
-        if let Some(cleanup) = self.cleanup.take() { cleanup(latest); }
+        if let Some(cleanup) = self.cleanup.take() { cleanup(latest, released); }
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let latest = self.close_routing();
+        self.finish_close(latest);
     }
 }
 
