@@ -403,6 +403,15 @@ pub struct Gpu {
     lost: Arc<AtomicBool>,
 }
 
+/// What a surface's compositor asks of a device's limits, given its adapter's
+/// (`Compositor::limits`); `compose::no_limits` without one.
+pub(crate) type WantedLimits<'a> = &'a dyn Fn(&wgpu::Limits) -> wgpu::Limits;
+
+/// The limits `wanted` asks of an adapter with `adapter`'s, none beyond them.
+fn capped(wanted: WantedLimits<'_>, adapter: &wgpu::Limits) -> wgpu::Limits {
+    wanted(adapter).or_worse_values_from(adapter)
+}
+
 /// Vulkan loaders crash when two threads create instances or devices at once (seen with
 /// parallel GPU tests on lavapipe), so Rune creates them one at a time.
 static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -433,23 +442,28 @@ impl Gpu {
     /// Like `try_new`, also enabling whichever of `wanted` the adapter supports.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn try_with_features(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, wanted: wgpu::Features) -> Result<Gpu, String> {
-        Self::try_for(instance, surface, wanted, false)
+        Self::try_for(instance, surface, wanted, &crate::compose::no_limits, false)
     }
 
-    /// Like `try_with_features`, preferring for a `translucent` surface `translucency::prefer`'s adapter.
+    /// Like `try_with_features`, with the limits a compositor wants (`Compositor::limits`).
+    pub(crate) fn try_with(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, wanted: wgpu::Features, limits: WantedLimits<'_>) -> Result<Gpu, String> {
+        Self::try_for(instance, surface, wanted, limits, false)
+    }
+
+    /// Like `try_with`, preferring for a `translucent` surface `translucency::prefer`'s adapter.
     #[cfg(not(target_arch = "wasm32"))]
-    fn try_for(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, wanted: wgpu::Features, translucent: bool) -> Result<Gpu, String> {
-        Self::try_picked(instance, surface, wanted, translucent, false)
+    fn try_for(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, wanted: wgpu::Features, limits: WantedLimits<'_>, translucent: bool) -> Result<Gpu, String> {
+        Self::try_picked(instance, surface, wanted, limits, translucent, false)
     }
 
     /// A device for a surface not made yet (`warm_gpu`): on the adapter a surface would get.
     #[cfg(not(any(target_arch = "wasm32", target_os = "macos")))]
     fn try_for_display(instance: wgpu::Instance, wanted: wgpu::Features) -> Result<Gpu, String> {
-        Self::try_picked(instance, None, wanted, false, true)
+        Self::try_picked(instance, None, wanted, &crate::compose::no_limits, false, true)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn try_picked(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, wanted: wgpu::Features, translucent: bool, presented: bool) -> Result<Gpu, String> {
+    fn try_picked(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, wanted: wgpu::Features, limits: WantedLimits<'_>, translucent: bool, presented: bool) -> Result<Gpu, String> {
         let _serial = GPU_INIT.lock().unwrap_or_else(|e| e.into_inner());
         let pick = crate::gpu::pick::pick(&instance, surface, presented)?;
         crate::marks::mark("gpu.adapter");
@@ -458,7 +472,7 @@ impl Gpu {
             Some(s) if translucent && !pick.from_env() => crate::render::translucency::prefer(&instance, s, &pick),
             _ => pick.adapter,
         };
-        match Self::device_on(&adapter, wanted) {
+        match Self::device_on(&adapter, wanted, limits) {
             Ok((device, queue)) => {
                 crate::marks::mark("gpu.device");
                 crate::native_surface::note_device(&device, surface.is_some() || presented);
@@ -477,7 +491,7 @@ impl Gpu {
                             && (!translucent || surface.is_none_or(|s| crate::render::translucency::mode(s, other).is_some()))
                     });
                 for other in others {
-                    if let Ok((device, queue)) = Self::device_on(&other, wanted) {
+                    if let Ok((device, queue)) = Self::device_on(&other, wanted, limits) {
                         eprintln!("rune: {} ({:?}) made no device ({error}); using {}", first.name, first.backend, other.get_info().name);
                         crate::native_surface::note_device(&device, surface.is_some() || presented);
                         return Ok(Gpu::made(instance, other, device, queue, surface.is_some() || presented));
@@ -489,7 +503,7 @@ impl Gpu {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn device_on(adapter: &wgpu::Adapter, wanted: wgpu::Features) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    fn device_on(adapter: &wgpu::Adapter, wanted: wgpu::Features, limits: WantedLimits<'_>) -> Result<(wgpu::Device, wgpu::Queue), String> {
         // Dual-source blending is for subpixel text (`FontSmoothing::WindfoilRgb`, `ClearType`).
         let optional_features = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::DUAL_SOURCE_BLENDING | wanted | crate::gpu::backend::free_features(adapter);
         // Precompiled uber shaders: a metallib on macOS, DXBC on Windows.
@@ -499,6 +513,7 @@ impl Gpu {
         // A compositor that asks for immediates (`Compositor::features`) gets all the adapter has.
         let max_immediate_size = if required_features.contains(wgpu::Features::IMMEDIATES) { adapter.limits().max_immediate_size } else { 0 };
         let adapter_limits = adapter.limits();
+        let wanted_limits = capped(limits, &adapter_limits);
         let required_limits = if adapter_limits.max_inter_stage_shader_variables < wgpu::Limits::default().max_inter_stage_shader_variables
             || adapter_limits.max_color_attachments < wgpu::Limits::default().max_color_attachments
             || adapter_limits.max_compute_workgroup_storage_size < wgpu::Limits::default().max_compute_workgroup_storage_size
@@ -520,7 +535,8 @@ impl Gpu {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rune"),
             required_features,
-            required_limits,
+            // Rune's own, raised to what a compositor wants (`Compositor::limits`).
+            required_limits: required_limits.or_better_values_from(&wanted_limits),
             experimental_features: Default::default(),
             // `Performance` suballocates from 128 MB device and 64 MB host blocks, so a device
             // that holds a few atlases commits about 190 MB more than it uses: process memory on
@@ -538,7 +554,12 @@ impl Gpu {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn try_for(i: wgpu::Instance, s: Option<&wgpu::Surface<'_>>, w: wgpu::Features, _: bool) -> Result<Gpu, String> { Self::try_with_features(i, s, w) }
+    fn try_for(i: wgpu::Instance, s: Option<&wgpu::Surface<'_>>, w: wgpu::Features, _: WantedLimits<'_>, _: bool) -> Result<Gpu, String> { Self::try_with_features(i, s, w) }
+
+    /// Whether the device has the limits `wanted` asks of its adapter (`Compositor::limits`).
+    pub(crate) fn has_limits(&self, wanted: WantedLimits<'_>) -> bool {
+        capped(wanted, &self.adapter.limits()).check_limits(&self.device.limits())
+    }
 
     pub fn headless() -> Gpu {
         Self::new(Self::instance(), None)
@@ -621,19 +642,19 @@ impl Gpu {
 
     /// The GPU for a window's first surface, which `surface` makes from the instance:
     /// `prewarm_gpu`'s device, with the renderer it made, when its adapter presents to that
-    /// surface and has `wanted`'s features; otherwise a new device on the same instance, so the
-    /// window never gets a second surface.
+    /// surface and has `wanted`'s features and `limits`; otherwise a new device on the same
+    /// instance, so the window never gets a second surface.
     /// A `translucent` surface gets an adapter that composites translucent pixels when any can.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub(crate) fn for_surface<'w>(wanted: wgpu::Features, translucent: bool,
+    pub(crate) fn for_surface<'w>(wanted: wgpu::Features, limits: WantedLimits<'_>, translucent: bool,
         surface: impl FnOnce(&wgpu::Instance) -> Result<wgpu::Surface<'w>, String>) -> Result<(Gpu, wgpu::Surface<'w>, Option<Renderer>), String> {
-        Self::for_surface_from(prewarm::take(), wanted, translucent, surface)
+        Self::for_surface_from(prewarm::take(), wanted, limits, translucent, surface)
     }
 
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    fn for_surface_from<'w>(early: Option<(Gpu, Renderer)>, wanted: wgpu::Features, translucent: bool,
+    fn for_surface_from<'w>(early: Option<(Gpu, Renderer)>, wanted: wgpu::Features, limits: WantedLimits<'_>, translucent: bool,
         surface: impl FnOnce(&wgpu::Instance) -> Result<wgpu::Surface<'w>, String>) -> Result<(Gpu, wgpu::Surface<'w>, Option<Renderer>), String> {
-        let made = Self::surface_gpu_from(early, wanted, translucent, surface)?;
+        let made = Self::surface_gpu_from(early, wanted, limits, translucent, surface)?;
         if std::env::var_os("RUNE_GPU_LOG").is_some_and(|v| v != "0") {
             eprintln!("rune: a surface draws with {}", crate::gpu::backend::describe(&made.0.device));
         }
@@ -641,7 +662,7 @@ impl Gpu {
     }
 
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    fn surface_gpu_from<'w>(early: Option<(Gpu, Renderer)>, wanted: wgpu::Features, translucent: bool,
+    fn surface_gpu_from<'w>(early: Option<(Gpu, Renderer)>, wanted: wgpu::Features, limits: WantedLimits<'_>, translucent: bool,
         surface: impl FnOnce(&wgpu::Instance) -> Result<wgpu::Surface<'w>, String>) -> Result<(Gpu, wgpu::Surface<'w>, Option<Renderer>), String> {
         // A prewarmed native Metal GPU lacking a wanted feature, or one that died since it was
         // made, is dropped before it makes a surface.
@@ -649,16 +670,16 @@ impl Gpu {
             let instance = Self::instance_for(wanted);
             let surface = surface(&instance)?;
             gpu_events::starting();
-            return Ok((Self::try_for(instance, Some(&surface), wanted, translucent)?, surface, None));
+            return Ok((Self::try_for(instance, Some(&surface), wanted, limits, translucent)?, surface, None));
         };
         let surface = surface(&early.instance)?;
-        if crate::render::translucency::serves(&early, &surface, wanted, translucent) {
+        if crate::render::translucency::serves(&early, &surface, wanted, limits, translucent) {
             return Ok((early, surface, Some(renderer)));
         }
         let instance = early.instance.clone();
         drop((renderer, early));
         gpu_events::starting();
-        Ok((Self::try_for(instance, Some(&surface), wanted, translucent)?, surface, None))
+        Ok((Self::try_for(instance, Some(&surface), wanted, limits, translucent)?, surface, None))
     }
 }
 
@@ -1149,6 +1170,9 @@ pub fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -
 mod backdrop_tests;
 
 #[cfg(test)]
+mod limits_tests;
+
+#[cfg(test)]
 #[path = "render/warm_tests.rs"]
 mod warm_tests;
 
@@ -1184,7 +1208,7 @@ mod prewarm_tests {
         crate::prewarm_gpu();
         crate::prewarm_gpu();
         let layer = layer();
-        let (gpu, _surface, renderer) = match Gpu::for_surface(wgpu::Features::empty(), false, |i| surface(i, &layer)) {
+        let (gpu, _surface, renderer) = match Gpu::for_surface(wgpu::Features::empty(), &crate::compose::no_limits, false, |i| surface(i, &layer)) {
             Ok(taken) => taken,
             Err(error) => return eprintln!("skipped: {error}"),
         };
@@ -1197,7 +1221,7 @@ mod prewarm_tests {
         assert!(native || gpu.device.features().contains(wgpu::Features::PASSTHROUGH_SHADERS));
         assert_eq!(renderer.format, wgpu::TextureFormat::Bgra8Unorm);
         drop((renderer, gpu));
-        let (_, _surface, again) = Gpu::for_surface(wgpu::Features::empty(), false, |i| surface(i, &layer)).expect("a second GPU");
+        let (_, _surface, again) = Gpu::for_surface(wgpu::Features::empty(), &crate::compose::no_limits, false, |i| surface(i, &layer)).expect("a second GPU");
         assert!(again.is_none(), "the prewarmed GPU goes to one window");
 
         // A slot that already took or discarded a GPU ignores a later `start`, so a late
@@ -1235,7 +1259,7 @@ mod prewarm_tests {
         let renderer = Renderer::new(&early.device, wgpu::TextureFormat::Bgra8UnormSrgb);
         let layer = layer();
         let mut made = 0;
-        let (gpu, _surface, renderer) = Gpu::for_surface_from(Some((early, renderer)), wanted, false, |i| { made += 1; surface(i, &layer) })
+        let (gpu, _surface, renderer) = Gpu::for_surface_from(Some((early, renderer)), wanted, &crate::compose::no_limits, false, |i| { made += 1; surface(i, &layer) })
             .expect("a GPU with the wanted feature");
         assert_eq!(made, 1);
         assert!(renderer.is_none(), "the prewarmed renderer belongs to the dropped device");
@@ -1243,8 +1267,26 @@ mod prewarm_tests {
 
         let Ok(early) = Gpu::try_new(Gpu::instance(), None) else { return };
         let renderer = Renderer::new(&early.device, wgpu::TextureFormat::Bgra8UnormSrgb);
-        let (_, _surface, kept) = Gpu::for_surface_from(Some((early, renderer)), wgpu::Features::empty(), false, |i| surface(i, &layer)).expect("a GPU");
+        let (_, _surface, kept) = Gpu::for_surface_from(Some((early, renderer)), wgpu::Features::empty(), &crate::compose::no_limits, false, |i| surface(i, &layer)).expect("a GPU");
         assert!(kept.is_some(), "a suitable prewarmed device keeps its renderer");
+    }
+
+    /// A prewarmed device short of a limit the window's compositor wants (and the adapter has) is
+    /// replaced on the same instance, as one missing a feature is.
+    #[test]
+    fn a_prewarmed_gpu_short_of_wanted_limits_is_redone_on_its_instance() {
+        let Ok(early) = Gpu::try_new(Gpu::instance(), None) else { return eprintln!("skipped: no GPU") };
+        let (made_with, adapters) = (early.device.limits().max_buffer_size, early.adapter.limits().max_buffer_size);
+        if adapters <= made_with { return eprintln!("skipped: the adapter has no larger buffers to ask for") }
+        let wants = |adapter: &wgpu::Limits| wgpu::Limits { max_buffer_size: adapter.max_buffer_size, ..crate::compose::no_limits(adapter) };
+        let renderer = Renderer::new(&early.device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let layer = layer();
+        let mut made = 0;
+        let (gpu, _surface, renderer) = Gpu::for_surface_from(Some((early, renderer)), wgpu::Features::empty(), &wants, false, |i| { made += 1; surface(i, &layer) })
+            .expect("a GPU with the wanted limits");
+        assert_eq!(made, 1);
+        assert!(renderer.is_none(), "the prewarmed renderer belongs to the dropped device");
+        assert_eq!(gpu.device.limits().max_buffer_size, adapters);
     }
 
     /// A compositor wanting a feature the native Metal backend lacks gets wgpu's device, when
@@ -1261,7 +1303,7 @@ mod prewarm_tests {
         let layer = layer();
         let mut made = 0;
         let wanted = wgpu::Features::POLYGON_MODE_LINE;
-        let (gpu, _surface, renderer) = Gpu::for_surface_from(Some((early, renderer)), wanted, false, |i| { made += 1; surface(i, &layer) })
+        let (gpu, _surface, renderer) = Gpu::for_surface_from(Some((early, renderer)), wanted, &crate::compose::no_limits, false, |i| { made += 1; surface(i, &layer) })
             .expect("a wgpu GPU");
         assert_eq!(made, 1);
         assert!(renderer.is_none());
@@ -1286,7 +1328,7 @@ mod prewarm_tests {
         let renderer = Renderer::new(&early.device, wgpu::TextureFormat::Bgra8UnormSrgb);
         let layer = layer();
         let wanted = wgpu::Features::IMMEDIATES;
-        let (gpu, _surface, kept) = Gpu::for_surface_from(Some((early, renderer)), wanted, false, |i| surface(i, &layer)).expect("a GPU");
+        let (gpu, _surface, kept) = Gpu::for_surface_from(Some((early, renderer)), wanted, &crate::compose::no_limits, false, |i| surface(i, &layer)).expect("a GPU");
         assert!(kept.is_some(), "the prewarmed renderer");
         assert!(crate::gpu::metal::raw_device(&gpu.device).is_some(), "the native backend's device");
         assert!(gpu.device.features().contains(wanted));

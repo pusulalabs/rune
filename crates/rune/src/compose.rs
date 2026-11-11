@@ -40,6 +40,17 @@ pub trait Compositor<S: 'static>: 'static {
         wgpu::Features::empty()
     }
 
+    /// Device limits to raise, given the `adapter`'s: a compositor that sizes its buffers from
+    /// `max_buffer_size`, `max_storage_buffer_binding_size` or `max_texture_array_layers` returns
+    /// the adapter's values in those fields. The device's limits are, field by field, the better
+    /// of Rune's own and these, and never beyond the adapter's; `Frame::device` reports what it
+    /// got. A device Rune already made that falls short of them (`prewarm_gpu`'s, another
+    /// window's) is not shared, as for a missing feature. The default asks for wgpu's lowest
+    /// limits, which raise nothing. A web canvas keeps Rune's own limits.
+    fn limits(&self, adapter: &wgpu::Limits) -> wgpu::Limits {
+        no_limits(adapter)
+    }
+
     /// Draws the frame into `f.target`. Runs after `Runtime::frame` built the instances, in the
     /// window and headless alike. Nothing has been recorded yet; `El::pixels` images are uploaded.
     /// `f.device` can change between frames (an overlay shown again on another GPU): keep
@@ -59,6 +70,12 @@ pub trait Compositor<S: 'static>: 'static {
     fn summary(&mut self, _device: &wgpu::Device) -> Option<String> {
         None
     }
+}
+
+/// `Compositor::limits` for a surface without a compositor, and its default: wgpu's lowest
+/// limits, none above the ones Rune asks for itself.
+pub(crate) fn no_limits(_: &wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits::downlevel_webgl2_defaults()
 }
 
 /// One frame handed to a compositor.

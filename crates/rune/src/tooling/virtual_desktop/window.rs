@@ -39,6 +39,8 @@ pub(crate) trait Member {
     fn radius(&self) -> f32;
     fn shadow(&self) -> bool;
     fn features(&self) -> wgpu::Features;
+    /// Its compositor's `Compositor::limits`, given the adapter's.
+    fn limits(&self, adapter: &wgpu::Limits) -> wgpu::Limits { crate::compose::no_limits(adapter) }
     /// Its first frame: where it opens on `desktop` when it has no position.
     fn start(&mut self, desktop: &VirtualDesktop);
     fn trace_on(&mut self);
@@ -248,6 +250,7 @@ impl<S: 'static> Member for Window<S> {
     fn radius(&self) -> f32 { self.radius }
     fn shadow(&self) -> bool { self.shadow }
     fn features(&self) -> wgpu::Features { self.comp.as_ref().map_or(wgpu::Features::empty(), |c| c.features()) }
+    fn limits(&self, adapter: &wgpu::Limits) -> wgpu::Limits { self.comp.as_ref().map_or_else(|| crate::compose::no_limits(adapter), |c| c.limits(adapter)) }
 
     fn start(&mut self, desktop: &VirtualDesktop) {
         let display = desktop.display_at(self.position);

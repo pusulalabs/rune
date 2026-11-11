@@ -138,7 +138,8 @@ pub(crate) fn headless_configured<S: 'static>(mut app: crate::app::App<S>, args:
 
     let t0 = Instant::now();
     let features = comp.as_ref().map_or(wgpu::Features::empty(), |c| c.features());
-    let gpu = Gpu::try_with_features(Gpu::instance_for(features), None, features).unwrap_or_else(|e| die(&e));
+    let device_limits = |adapter: &wgpu::Limits| comp.as_ref().map_or_else(|| crate::compose::no_limits(adapter), |c| c.limits(adapter));
+    let gpu = Gpu::try_with(Gpu::instance_for(features), None, features, &device_limits).unwrap_or_else(|e| die(&e));
     let mut target_format = if srgb_blend { OFFSCREEN_FORMAT.remove_srgb_suffix() } else { OFFSCREEN_FORMAT };
     let mut renderer = Renderer::new(&gpu.device, target_format);
     renderer.set_srgb_blend(srgb_blend);

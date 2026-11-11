@@ -60,6 +60,8 @@ impl<T: 'static> Overlay<T> {
             }
         };
         let features = self.compositor.as_ref().map_or(wgpu::Features::empty(), |c| c.features());
+        let compositor = self.compositor.as_deref();
+        let limits = |adapter: &wgpu::Limits| compositor.map_or_else(|| crate::compose::no_limits(adapter), |c| c.limits(adapter));
         // A device that died while the overlay was hidden (a driver reset, a resume from
         // Modern Standby) can configure nothing: the next surface gets a new one.
         if self.gpu.as_ref().is_some_and(|gpu| gpu.is_lost()) {
@@ -71,12 +73,12 @@ impl<T: 'static> Overlay<T> {
         let pooled = self.gpu.clone().map(|gpu| (gpu, false)).or_else(|| self.gpu_pool.borrow().upgrade().filter(|gpu| {
             !gpu.is_lost() && gpu.device.features().contains(features & gpu.adapter.features())
         }).map(|gpu| (gpu, true)));
-        let reused = pooled.and_then(|(gpu, translucent)| make(&gpu.instance).filter(|s| crate::render::translucency::serves(&gpu, s, features, translucent)).map(|s| (gpu, s)));
+        let reused = pooled.and_then(|(gpu, translucent)| make(&gpu.instance).filter(|s| crate::render::translucency::serves(&gpu, s, features, &limits, translucent)).map(|s| (gpu, s)));
         let mut prewarmed = None;
         let surface = match reused {
             Some((gpu, surface)) => { self.gpu = Some(gpu); surface }
             None => {
-                let made = Gpu::for_surface(features, true, |instance| make(instance).ok_or_else(|| "could not create its GPU surface".to_owned()));
+                let made = Gpu::for_surface(features, &limits, true, |instance| make(instance).ok_or_else(|| "could not create its GPU surface".to_owned()));
                 let (gpu, surface, renderer) = match made {
                     Ok(made) => made,
                     Err(error) => {

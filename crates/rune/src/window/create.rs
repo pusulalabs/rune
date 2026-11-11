@@ -109,16 +109,18 @@ impl<S: 'static> Host<S> {
             }
             None => {
                 let features = self.comp.as_ref().map_or(wgpu::Features::empty(), |c| c.features());
+                let comp = self.comp.as_deref();
+                let limits = |adapter: &wgpu::Limits| comp.map_or_else(|| crate::compose::no_limits(adapter), |c| c.limits(adapter));
                 let transparent = self.options.transparent;
                 // A shared device that can't composite this window's translucent pixels gets its own.
                 let cached = self.gpu_pool.borrow().upgrade().filter(|gpu| !gpu.is_lost()).and_then(|gpu| {
                     let surface = gpu.instance.create_surface(window.clone()).ok()?;
-                    crate::render::translucency::serves(&gpu, &surface, features, transparent).then_some((gpu, surface))
+                    crate::render::translucency::serves(&gpu, &surface, features, &limits, transparent).then_some((gpu, surface))
                 });
                 let (gpu, surface) = if let Some(cached) = cached {
                     cached
                 } else {
-                    let (gpu, surface, renderer) = Gpu::for_surface(features, transparent, |instance| instance.create_surface(window.clone()).map_err(|e| e.to_string()))?;
+                    let (gpu, surface, renderer) = Gpu::for_surface(features, &limits, transparent, |instance| instance.create_surface(window.clone()).map_err(|e| e.to_string()))?;
                     prewarmed = renderer;
                     let gpu = Arc::new(gpu);
                     *self.gpu_pool.borrow_mut() = Arc::downgrade(&gpu);
@@ -309,8 +311,10 @@ impl<S: 'static> Host<S> {
         self.rt.text.atlas.invalidate();
         self.rt.images.invalidate();
         let features = self.comp.as_ref().map_or(wgpu::Features::empty(), |c| c.features());
+        let comp = self.comp.as_deref();
+        let limits = |adapter: &wgpu::Limits| comp.map_or_else(|| crate::compose::no_limits(adapter), |c| c.limits(adapter));
         let transparent = self.options.transparent;
-        let (gpu, surface, prewarmed) = Gpu::for_surface(features, transparent,
+        let (gpu, surface, prewarmed) = Gpu::for_surface(features, &limits, transparent,
             |instance| instance.create_surface(window.clone()).map_err(|e| e.to_string()))?;
         let gpu = Arc::new(gpu);
         let size = window.inner_size();

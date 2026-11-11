@@ -18,11 +18,12 @@ pub(crate) fn mode(surface: &wgpu::Surface<'_>, adapter: &wgpu::Adapter) -> Opti
         .find(|mode| caps.alpha_modes.contains(mode))
 }
 
-/// Whether `gpu` can draw `surface` with `wanted`'s features its adapter supports, and, for a
-/// `translucent` surface, composite translucent pixels on it.
-pub(crate) fn serves(gpu: &crate::render::Gpu, surface: &wgpu::Surface<'_>, wanted: wgpu::Features, translucent: bool) -> bool {
+/// Whether `gpu` can draw `surface` with `wanted`'s features and `limits` as far as its adapter
+/// supports them, and, for a `translucent` surface, composite translucent pixels on it.
+pub(crate) fn serves(gpu: &crate::render::Gpu, surface: &wgpu::Surface<'_>, wanted: wgpu::Features, limits: crate::render::WantedLimits<'_>, translucent: bool) -> bool {
     gpu.adapter.is_surface_supported(surface)
         && gpu.device.features().contains(wanted & gpu.adapter.features())
+        && gpu.has_limits(limits)
         && crate::gpu::backend::serves(&gpu.device, wanted)
         && (!translucent || mode(surface, &gpu.adapter).is_some())
 }
