@@ -12,12 +12,20 @@
 //! wakes the loop and runs it until the hooks have run before it answers; when it comes while
 //! a loop handler runs (a modal loop inside one), it can only end that loop and let the hooks
 //! run once the handler returns.
+//!
+//! Before a quit the system asks for starts (macOS `applicationShouldTerminate:`, Windows
+//! `WM_QUERYENDSESSION`), a window may refuse it (`App::on_quit_request`). The system waits for
+//! that answer too, so the request wakes the loop and runs it where it stands until every
+//! window answered ([`allowed`], [`answer`]); a refusal starts no quit. Only an app with such a
+//! window asks, so any other answers at once, as before.
 
 use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 mod mac;
 pub(crate) mod relaunch;
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+mod tests;
 #[cfg(target_os = "windows")]
 mod win32;
 
@@ -172,15 +180,85 @@ pub fn quitting() -> bool {
 }
 
 /// Hooks the system's quit requests into the loop: `send` delivers a quit (`true` when the
-/// session ends now and the windows must close) to `Windows`. Once per process, on the UI thread.
+/// session ends now and the windows must close) to `Windows`, and `ask` has it ask its windows
+/// whether the app may quit ([`allowed`]); each is false once the loop is gone. Once per
+/// process, on the UI thread.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-pub(crate) fn install(send: impl Fn(bool) -> bool + 'static) {
+pub(crate) fn install(send: impl Fn(bool) -> bool + 'static, ask: impl Fn() -> bool + 'static) {
+    ASK.with(|a| if let Ok(mut a) = a.try_borrow_mut() { *a = Some(Box::new(ask)); });
     #[cfg(target_os = "windows")]
     win32::install(send);
     #[cfg(target_os = "macos")]
     { let _ = send; mac::install(); }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let _ = send;
+}
+
+/// Whether some window has `App::on_quit_request`: only then does a quit request ask.
+static ASKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A window with `App::on_quit_request` started: the system's quit requests ask the windows
+/// from now on.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn asks_windows() {
+    ASKS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A quit request the system waits on, on the UI thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Request {
+    /// None waits.
+    Idle,
+    /// The loop is asking its windows.
+    Asked,
+    /// They answered whether the app may quit.
+    Answered(bool),
+}
+
+thread_local! {
+    /// Has the loop ask its windows whether the app may quit; false once the loop is gone.
+    static ASK: std::cell::RefCell<Option<Box<dyn Fn() -> bool>>> = const { std::cell::RefCell::new(None) };
+    static REQUEST: std::cell::Cell<Request> = const { std::cell::Cell::new(Request::Idle) };
+}
+
+/// How long a quit request runs the loop for the windows' answer before it goes ahead anyway:
+/// Windows shows that the app is preventing shutdown after five seconds.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+const WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether the quit the system asks for may go ahead: no window has `App::on_quit_request`, or
+/// every window's agrees. `run` runs the loop until [`answering`] is over, as the platform's
+/// modal loops do. A request that comes while a loop handler runs (a modal loop inside one)
+/// can't ask the windows, so it is refused; one whose answer never comes (the loop is gone, or
+/// it took longer than `run` waits) goes ahead, as it would without the hook.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn allowed(run: impl FnOnce()) -> bool {
+    if !ASKS.load(std::sync::atomic::Ordering::Relaxed) { return true; }
+    if loop_state() == Loop::Handling { return false; }
+    let sent = ASK.with(|ask| ask.try_borrow().ok().and_then(|ask| ask.as_ref().map(|ask| ask()))).unwrap_or(false);
+    if !sent { return true; }
+    REQUEST.set(Request::Asked);
+    run();
+    match REQUEST.replace(Request::Idle) {
+        Request::Answered(allowed) => allowed,
+        Request::Idle | Request::Asked => true,
+    }
+}
+
+/// Whether a quit request still waits for the windows' answer.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn answering() -> bool {
+    REQUEST.get() == Request::Asked
+}
+
+/// The windows' answer to the quit request that waits ([`allowed`]); an answer nothing waits
+/// for any more changes nothing.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn answer(allowed: bool) {
+    if REQUEST.get() != Request::Asked { return; }
+    REQUEST.set(Request::Answered(allowed));
+    #[cfg(target_os = "macos")]
+    mac::stop_loop();
 }
 
 /// Whether the event loop is inside one of its handlers, on the UI thread: a session message
@@ -199,7 +277,7 @@ thread_local! {
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn handling() -> Handling { Handling(LOOP.replace(Loop::Handling)) }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) fn loop_state() -> Loop { LOOP.get() }
 
 pub(crate) struct Handling(Loop);

@@ -13,6 +13,10 @@
 //! or a synchronous send. winit then holds the wake until the handler returns, and a paint run
 //! from here would re-enter it, so the window runs no loop: it ends a tracking menu (the usual
 //! modal loop) and answers, and the hooks run as the handler returns, before `WM_ENDSESSION`.
+//!
+//! A window may refuse the query (`App::on_quit_request`): the loop runs here the same way
+//! until it has asked its windows (`super::allowed`), and a refusal answers `FALSE`, which
+//! starts no quit and keeps the session.
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -27,9 +31,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::{Event, Hooks, Loop, State};
 
-/// How long the window runs the loop for the hooks before it answers anyway: Windows shows
-/// that the app is preventing shutdown after five seconds.
-const WAIT: Duration = Duration::from_secs(3);
+/// How long the window runs the loop for the hooks before it answers anyway.
+const WAIT: Duration = super::WAIT;
 
 type Deliver = Box<dyn Fn(bool) -> bool>;
 
@@ -64,6 +67,10 @@ pub(super) fn install(deliver: impl Fn(bool) -> bool + 'static) {
 unsafe extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match message {
         WM_QUERYENDSESSION => {
+            // A window's `App::on_quit_request` refused: the session goes on, and no quit starts.
+            if !super::allowed(|| run_loop(|| !super::answering(), "the windows didn't answer whether the session may end in time")) {
+                return 0;
+            }
             answer(false);
             TRUE as LRESULT
         }
@@ -94,7 +101,7 @@ fn answer(ending: bool) {
                 eprintln!("rune: the session ended inside a loop handler, before the windows' App::on_quit ran");
             }
         }
-        Loop::Idle if sent => run_loop(ending),
+        Loop::Idle if sent => run_loop(move || answered(ending), "the session ends before the windows' App::on_quit ran"),
         Loop::Idle => {}
     }
 }
@@ -109,14 +116,15 @@ fn answered(ending: bool) -> bool {
     }
 }
 
-/// Runs the loop's messages until `Windows` answered the message, for at most `WAIT`.
-fn run_loop(ending: bool) {
-    let ran = std::panic::catch_unwind(|| {
+/// Runs the loop's messages until `Windows` answered the message (`done`), for at most `WAIT`,
+/// saying `late` when it didn't in time.
+fn run_loop(done: impl Fn() -> bool + std::panic::UnwindSafe, late: &'static str) {
+    let ran = std::panic::catch_unwind(move || {
         let deadline = Instant::now() + WAIT;
-        while !answered(ending) {
+        while !done() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                eprintln!("rune: the session ends before the windows' App::on_quit ran");
+                eprintln!("rune: {late}");
                 break;
             }
             // SAFETY: `msg` is written by PeekMessageW before it is read; dispatching on the

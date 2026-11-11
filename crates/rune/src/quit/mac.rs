@@ -4,9 +4,15 @@
 //! app quitting and lets the quit go ahead; `applicationWillTerminate:` follows at once, where
 //! winit ends the loop and `Windows::exiting` runs every window's `App::on_quit`, then its
 //! `on_close`.
+//!
+//! AppKit wants the answer when the method returns. With a window that may refuse the quit
+//! (`App::on_quit_request`), the method runs the main run loop where it stands, as a modal loop
+//! does, until the loop has asked its windows (`super::allowed`), and answers
+//! `NSTerminateCancel` when one refused: no quit starts, and a logout or shutdown is cancelled.
 
 use std::cell::Cell;
 use std::ffi::{c_char, c_void};
+use std::time::Instant;
 
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::{msg_send, sel};
@@ -22,13 +28,51 @@ unsafe extern "C" {
     fn class_addMethod(class: *const AnyClass, selector: Sel, implementation: *const c_void, types: *const c_char) -> Bool;
 }
 
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFRunLoopDefaultMode: *const c_void;
+    fn CFRunLoopGetMain() -> *mut c_void;
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: u8) -> i32;
+    fn CFRunLoopStop(run_loop: *mut c_void);
+}
+
+/// `NSTerminateCancel`.
+const TERMINATE_CANCEL: usize = 0;
 /// `NSTerminateNow`.
 const TERMINATE_NOW: usize = 1;
 
 extern "C" fn should_terminate(_: *mut AnyObject, _: Sel, _: *mut AnyObject) -> usize {
+    let allowed = std::panic::catch_unwind(|| super::allowed(run_loop)).unwrap_or_else(|_| {
+        eprintln!("rune: a quit request hook panicked");
+        true
+    });
+    if !allowed { return TERMINATE_CANCEL; }
     // Windows::exiting carries out the quit's effects.
     let _ = super::send(super::Event::Start { ending: false, after: super::After::Exit });
     TERMINATE_NOW
+}
+
+/// Runs the main run loop until the windows answered the quit request (`stop_loop` ends each
+/// run), for at most `WAIT`. winit hands its loop the wake that asks them from this run.
+fn run_loop() {
+    let deadline = Instant::now() + super::WAIT;
+    while super::answering() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            eprintln!("rune: the windows didn't answer a quit request in time; quitting");
+            break;
+        }
+        // SAFETY: the main thread's run loop, run on it in its default mode, as AppKit's own
+        // modal loops run it inside a delegate method.
+        unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, left.as_secs_f64(), 0) };
+    }
+}
+
+/// Ends `run_loop`'s run once the windows answered.
+pub(super) fn stop_loop() {
+    // SAFETY: stops the innermost run of the main run loop, the one `run_loop` started: the
+    // answer comes from the loop's handler, which that run called.
+    unsafe { CFRunLoopStop(CFRunLoopGetMain()) }
 }
 
 pub(super) fn install() {

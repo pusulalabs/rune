@@ -289,6 +289,7 @@ impl<S: 'static> Host<S> {
         }
         for _ in 0..8 {
             let minimize = std::mem::take(&mut self.rt.minimize_request);
+            let asked = self.rt.take_close_asked();
             match self.rt.shell_request.take() {
                 Some(shell @ (Shell::Quit | Shell::Relaunch)) => {
                     let after = shell.after().unwrap_or(crate::quit::After::Exit);
@@ -297,6 +298,8 @@ impl<S: 'static> Host<S> {
                     self.file_dialog.cancel(&mut self.rt);
                     event_loop.exit();
                 }
+                // The user's own close (⌘W, a caption's close button), as the close button's.
+                Some(Shell::Close) if asked => self.close_request(event_loop),
                 Some(Shell::Close) => self.close(event_loop),
                 None if minimize => self.minimize(),
                 None => {}
@@ -319,6 +322,25 @@ impl<S: 'static> Host<S> {
             // minimize.
             if self.rt.shell_request.is_none() && !self.rt.minimize_request { return; }
         }
+    }
+
+    /// The user asks to close the window: its close button, ⌘W, the system's close request.
+    /// `App::on_close_request` answers first, for a window whose close would run `on_close`
+    /// (`closes`); when it refuses, nothing closes and the window stays as it is.
+    pub(super) fn close_request(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(f) = self.on_close_request.filter(|_| self.closes()) && !self.ask(event_loop, f) { return; }
+        self.close(event_loop);
+    }
+
+    /// Runs a hook that answers a request (`App::on_close_request`, `App::on_quit_request`) and
+    /// returns its answer. As an update, so its frame, wakes, window requests and quit go as
+    /// an update's do.
+    pub(super) fn ask(&mut self, event_loop: &ActiveEventLoop, f: fn(&mut S, &mut Tx) -> bool) -> bool {
+        let allowed = Arc::new(AtomicBool::new(true));
+        let answer = allowed.clone();
+        self.shared.queue_update(Box::new(move |s, tx| { answer.store(f(s, tx), Ordering::Relaxed); true }));
+        self.drain(event_loop, false);
+        allowed.load(Ordering::Relaxed)
     }
 
     pub(super) fn close(&mut self, event_loop: &ActiveEventLoop) {

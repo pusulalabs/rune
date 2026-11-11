@@ -65,7 +65,9 @@ pub struct App<S: 'static> {
     pub(crate) standard_menus: bool,
     pub(crate) keep_running: bool,
     pub(crate) on_close: Option<fn(&mut S, &mut Tx)>,
+    pub(crate) on_close_request: Option<fn(&mut S, &mut Tx) -> bool>,
     pub(crate) on_quit: Option<fn(&mut S, &mut Tx)>,
+    pub(crate) on_quit_request: Option<fn(&mut S, &mut Tx) -> bool>,
     pub(crate) turn_scope: Option<TurnScope<S>>,
     pub(crate) on_focus: Option<fn(&mut S, bool, &mut Tx)>,
     pub(crate) on_mods: Option<fn(&mut S, crate::Mods, &mut Tx)>,
@@ -121,7 +123,9 @@ impl<S: 'static> App<S> {
             standard_menus: false,
             keep_running: false,
             on_close: None,
+            on_close_request: None,
             on_quit: None,
+            on_quit_request: None,
             turn_scope: None,
             on_focus: None,
             on_mods: None,
@@ -419,6 +423,20 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// Runs on the UI thread when the user asks to close the window, before anything hides: its
+    /// close button, ⌘W or the standard Close menu item, a caption's close button, and the
+    /// system's own close request (Alt+F4, the taskbar, a Wayland compositor). Return true to
+    /// let the close go ahead as it does without the hook (`on_close` runs, `keep_running`
+    /// applies). Return false to cancel it: the window stays as it was, so the app can ask
+    /// about unsaved changes and close the window itself later with `Tx::close_window`,
+    /// `AppHandle::close` or `WindowHandle::close`, none of which ask. It runs as an update:
+    /// state it changes shows in the next frame, and what it asks of its `Tx` happens. A quit
+    /// asks `on_quit_request` instead. Native windows only.
+    pub fn on_close_request(mut self, f: fn(&mut S, &mut Tx) -> bool) -> Self {
+        self.on_close_request = Some(f);
+        self
+    }
+
     /// Runs once in every open window when the app starts to quit, before any window closes
     /// for it: `Tx::quit` or `AppHandle::quit` from any window, the last window closing (in the
     /// windows still open), macOS Quit (⌘Q, the Dock, logout, restart and shutdown), and a
@@ -431,6 +449,21 @@ impl<S: 'static> App<S> {
     /// What it asks of its `Tx` beyond state is moot once the loop ends. Native windows only.
     pub fn on_quit(mut self, f: fn(&mut S, &mut Tx)) -> Self {
         self.on_quit = Some(f);
+        self
+    }
+
+    /// Runs on the UI thread in every open window when the system asks the app to quit, before
+    /// any `on_quit` or `on_close`: macOS Quit (⌘Q, the Dock, logout, restart and shutdown), and
+    /// a Windows logoff, shutdown or installer asking the app to close (`WM_QUERYENDSESSION`).
+    /// Return true to let the quit go ahead. When any window returns false the quit is
+    /// cancelled, a logout or shutdown with it, and the app runs on; every window is still
+    /// asked. The app then quits itself with `Tx::quit` or `AppHandle::quit`, which don't ask,
+    /// as the last window closing doesn't. It runs as an update, like `on_close_request`. A
+    /// request that arrives while one of the app's handlers runs a modal loop (a native dialog
+    /// it opened) can't ask the windows, and is cancelled. Native windows only; other
+    /// platforms have no such request.
+    pub fn on_quit_request(mut self, f: fn(&mut S, &mut Tx) -> bool) -> Self {
+        self.on_quit_request = Some(f);
         self
     }
 
@@ -694,7 +727,7 @@ impl<S: 'static> AppHandle<S> {
     }
 
     /// Close the window as the close button would (`App::on_close` runs; without
-    /// `keep_running` the app quits).
+    /// `keep_running` the app quits), without asking `App::on_close_request`.
     pub fn close(&self) {
         self.request(|q| { q.window = Some(WindowRequest::Close); q.minimize = false; });
     }
@@ -1147,6 +1180,10 @@ mod tests {
         let mut rt = Runtime::new(0u32, |_: &u32, _: &mut Cx<u32>| el(), (100.0, 100.0), Env::default());
         press(&mut rt, Code::KeyW, 'w', Unhandled::Close);
         assert_eq!(rt.shell_request.take(), Some(Shell::Close), "an unhandled ⌘W closes as the button would");
+        assert!(rt.take_close_asked() && !rt.take_close_asked(), "and asks `on_close_request` as it would, once");
+        rt.update(|_, tx| tx.close_window());
+        assert_eq!(rt.shell_request.take(), Some(Shell::Close));
+        assert!(!rt.take_close_asked(), "the app's own close doesn't ask");
         press(&mut rt, Code::KeyM, 'm', Unhandled::Minimize);
         assert!(std::mem::take(&mut rt.minimize_request) && rt.shell_request.is_none());
         rt.on_key = Some(|n, ev, _| { *n += 1; ev.is_command('w') });

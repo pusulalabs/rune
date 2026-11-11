@@ -57,6 +57,8 @@ pub struct Tx {
     pub(crate) keep_on_screen: Vec<String>,
     pub(crate) wakes: Vec<std::time::Duration>,
     pub(crate) shell: Option<Shell>,
+    /// `Tx::request_close`: the user asked for the close in `shell`.
+    pub(crate) close_asked: bool,
     pub(crate) minimize: bool,
     /// `Tx::toggle_maximized`.
     pub(crate) toggle_maximized: bool,
@@ -243,9 +245,17 @@ impl Tx {
         self.wakes.push(std::time::Duration::from_secs_f64((due - self.clock).max(0.0)));
     }
 
-    /// Close the window after this handler, as the close button would (`App::on_close` runs).
+    /// Close the window after this handler, as the close button would (`App::on_close` runs),
+    /// without asking `App::on_close_request`.
     pub fn close_window(&mut self) {
         self.shell = self.shell.max(Some(Shell::Close));
+    }
+
+    /// `close_window` for a close the user asked for (⌘W, a caption's close button): the window
+    /// asks `App::on_close_request` first, as for its native close button.
+    pub(crate) fn request_close(&mut self) {
+        self.close_window();
+        self.close_asked = true;
     }
 
     /// Quit the app after this handler, whether or not it keeps running without a window. Every

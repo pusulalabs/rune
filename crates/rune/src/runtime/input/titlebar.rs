@@ -20,6 +20,8 @@ pub(super) struct Titlebar {
     pub(super) insets: crate::ChromeInsets,
     /// The Windows caption buttons the view gets drawn over it, with their state.
     pub(super) caption: Option<crate::titlebar::Caption>,
+    /// `Tx::request_close`: the user asked for the close the shell carries out next.
+    pub(super) close_asked: bool,
     /// `Tx::toggle_maximized`, for the shell.
     pub(super) toggle_maximized: bool,
     /// `Tx::toggle_full_screen`, for the shell.
@@ -125,6 +127,13 @@ impl<S: 'static> Runtime<S> {
         self.set_chrome_insets(crate::ChromeInsets::new(leading, trailing, height));
         self.set_caption(caption);
         chrome
+    }
+
+    /// Takes whether the user asked for the close the shell carries out (`Tx::request_close`),
+    /// which `App::on_close_request` may then refuse.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub(crate) fn take_close_asked(&mut self) -> bool {
+        std::mem::take(&mut self.titlebar.close_asked)
     }
 
     /// Takes a `Tx::toggle_maximized`, for the shell to carry out.

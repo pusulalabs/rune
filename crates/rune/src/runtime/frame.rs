@@ -171,6 +171,7 @@ impl<S: 'static> Runtime<S> {
     pub(super) fn latch_requests(&mut self, tx: &mut Tx) {
         self.run_pick_reads(tx);
         self.shell_request = self.shell_request.max(tx.shell.take());
+        self.titlebar.close_asked |= std::mem::take(&mut tx.close_asked);
         self.minimize_request |= std::mem::take(&mut tx.minimize);
         self.titlebar.toggle_maximized |= std::mem::take(&mut tx.toggle_maximized);
         self.titlebar.toggle_full_screen |= std::mem::take(&mut tx.toggle_full_screen);

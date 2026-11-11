@@ -156,7 +156,7 @@ impl<S: 'static> Host<S> {
                 if covered { self.land_frame(); }
                 self.set_cover(Cover::Windows, covered);
             }
-            WakeEvent::Reopen | WakeEvent::Turn | WakeEvent::Quit(_) => {}
+            WakeEvent::Reopen | WakeEvent::Turn | WakeEvent::Quit(_) | WakeEvent::QuitRequest => {}
         }
     }
 
@@ -223,7 +223,7 @@ impl<S: 'static> Host<S> {
                 if self.life.finished() || self.win.is_none() { return; }
             }
             WindowEvent::CloseRequested => {
-                self.close(event_loop);
+                self.close_request(event_loop);
                 return;
             }
             WindowEvent::HoveredFile(path) => { self.files.file(path, false); return; }

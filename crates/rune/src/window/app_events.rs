@@ -1,4 +1,5 @@
-//! What the whole app hears, not one window: a quit (`crate::quit`) and a reopen.
+//! What the whole app hears, not one window: a quit (`crate::quit`), the system asking for
+//! one, and a reopen.
 
 use super::*;
 
@@ -32,6 +33,15 @@ impl Windows {
                 Effect::Relaunch => {}
             }
         }
+    }
+
+    /// The system asks whether the app may quit, and waits (`crate::quit::allowed`): every
+    /// window still open runs `App::on_quit_request`, also after one refused, and one refusal
+    /// cancels the quit.
+    pub(super) fn quit_request(&mut self, event_loop: &ActiveEventLoop) {
+        let mut allowed = true;
+        for host in self.hosts.iter_mut().flatten() { allowed &= host.quit_request_hook(event_loop); }
+        crate::quit::answer(allowed);
     }
 
     /// The app was reopened: every `on_reopen` hook runs, then, unless one handled it or the

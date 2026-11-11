@@ -49,6 +49,7 @@ impl<S: 'static> AnyHost for Host<S> {
     // What reaches the app's state runs in its turn scope (`App::turn_scope`).
     fn terminate(&mut self) { self.in_turn(Self::terminate_in_turn) }
     fn quit_hook(&mut self) { self.in_turn(Self::quit_hook_in_turn) }
+    fn quit_request_hook(&mut self, event_loop: &ActiveEventLoop) -> bool { self.in_turn(|h| h.quit_request_hook_in_turn(event_loop)) }
     fn vanish(&mut self) {
         if let Some(w) = self.shown_win() { w.hide(); }
     }
@@ -119,6 +120,13 @@ impl<S: 'static> Host<S> {
         // Before the loop ends or the session does: a lock or clear must reach the worker.
         self.clipboard.flush(&mut self.rt);
         if let Some(w) = self.shown_win() { w.request_redraw(); }
+    }
+
+    fn quit_request_hook_in_turn(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let Some(f) = self.on_quit_request.filter(|_| self.started && !self.life.finished()) else { return true };
+        let allowed = self.ask(event_loop, f);
+        self.publish();
+        allowed
     }
 
     fn cancel_menus_in_turn(&mut self) {
