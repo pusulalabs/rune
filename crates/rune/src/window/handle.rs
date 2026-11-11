@@ -150,6 +150,19 @@ impl WindowHandle {
         let handle = window.window_handle().map_err(|e| e.to_string())?;
         Ok(f(handle))
     }
+    /// Borrow the native window while alive, for what Rune doesn't wrap: warping the pointer,
+    /// `drag_resize_window`, a display handle for a native dialog or a drag. An error while
+    /// there is no native window: before the first is created, and after one is destroyed (a
+    /// window closed for good; one hidden on Wayland or with `App::release_gpu_when_closed`)
+    /// until `App::on_window` runs for the next. As for [`Self::with_raw_handle`], platform
+    /// thread restrictions still apply, so call it on the UI thread, and do not retain anything
+    /// borrowed from the window beyond the callback. Rune keeps driving the window: leave it
+    /// what it sets itself, such as visibility, the cursor and IME. [`crate::winit`] is the
+    /// winit the window is built with.
+    pub fn with_window<R>(&self, f: impl FnOnce(&Window) -> R) -> Result<R, String> {
+        let window = self.window()?;
+        Ok(f(&window))
+    }
 }
 
 #[cfg(target_os = "macos")]
