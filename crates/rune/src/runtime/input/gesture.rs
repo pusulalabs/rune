@@ -214,6 +214,15 @@ impl<S: 'static> Runtime<S> {
         }
     }
 
+    /// Whether a Ctrl + primary press at (x, y) stays a primary press on macOS, where it is a
+    /// secondary one otherwise: an element there asked for it ([`El::control_click_presses`]).
+    pub fn control_click_presses(&self, x: f32, y: f32) -> bool {
+        let hit = self.hits.iter().rev().find(|&&(id, r)| self.hit_contains(id, r, x, y)).and_then(|(id, _)| self.node_index.get(id).copied());
+        std::iter::successors(hit, |&i| self.nodes[i].parent)
+            .take_while(|&i| !self.subtree_exiting(i) && self.allowed(i))
+            .any(|i| self.nodes[i].handlers.gestures.as_ref().is_some_and(|g| g.control_click))
+    }
+
     /// A key came up, for the [`El::on_key_up`] handlers: true when one is there to hear it,
     /// and a frame is needed. A host with physical keys passes the release's logical key to
     /// `physical_then` instead, so the focused `on_physical_input` hears it first.
@@ -402,5 +411,23 @@ mod tests {
         rt.frame(0.0);
         assert_eq!(rt.state.zoom, [20.0 / PINCH_WHEEL]);
         assert!(!rt.pinch_wheel(500.0, 50.0, -20.0), "off the window nothing takes it");
+    }
+
+    fn canvas(_: &State, _: &mut crate::Cx<State>) -> El {
+        el().w_full().h_full()
+            .child(el().key("canvas").size(40.0, 40.0).control_click_presses().on_drag(|_: &mut State, _, _| {})
+                .child(el().key("handle").size(10.0, 10.0).on_press(|_: &mut State| {})))
+            .child(el().key("row").size(40.0, 40.0).on_press(|_: &mut State| {}))
+    }
+
+    #[test]
+    fn a_control_click_presses_only_over_an_element_that_asked() {
+        let mut rt = Runtime::new(State::default(), canvas, (100.0, 100.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let presses = |key: &str| { let (x, y) = rt.find(key).unwrap(); rt.control_click_presses(x, y) };
+        assert!(presses("canvas"));
+        assert!(presses("handle"), "and over what is inside it");
+        assert!(!presses("row"), "elsewhere a control-click stays the secondary press");
+        assert!(!rt.control_click_presses(500.0, 50.0), "as it does off the window");
     }
 }

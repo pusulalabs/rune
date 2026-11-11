@@ -128,6 +128,8 @@ pub(crate) struct CanvasInput {
     pub smart_magnify: Option<SmartMagnifyFn>,
     /// [`PointerButton::bit`]s of the buttons besides the primary that press and drag it.
     pub buttons: u8,
+    /// [`El::control_click_presses`].
+    pub control_click: bool,
 }
 
 impl CanvasInput {
@@ -189,6 +191,16 @@ impl El {
     pub fn pointer_buttons(mut self, buttons: impl IntoIterator<Item = PointerButton>) -> Self {
         let bits = buttons.into_iter().fold(0, |bits, b| bits | b.bit());
         self.canvas_input().buttons |= bits;
+        self
+    }
+
+    /// A Ctrl + primary press over this element stays a primary press, with [`Mods::ctrl`] set
+    /// (`Tx::mods`), where macOS would make it a control-click: the secondary press that opens
+    /// a menu. A canvas that pans while Ctrl is held and the pointer drags asks for this. The
+    /// secondary button still reaches `on_secondary_press`. No effect off macOS, where
+    /// Ctrl + primary is a primary press already.
+    pub fn control_click_presses(mut self) -> Self {
+        self.canvas_input().control_click = true;
         self
     }
 

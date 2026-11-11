@@ -475,10 +475,13 @@ impl<S: 'static> Host<S> {
                 l.request_redraw();
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                let at = button_at(rt, &l.window);
                 if state == ElementState::Pressed {
-                    self.control_click = cfg!(target_os = "macos") && self.mods.control_key();
+                    // A control-click is a secondary press, unless what is under it presses.
+                    self.control_click = cfg!(target_os = "macos") && self.mods.control_key()
+                        && !at.is_some_and(|(x, y)| rt.control_click_presses(x, y));
                 }
-                if let Some((x, y)) = button_at(rt, &l.window) {
+                if let Some((x, y)) = at {
                     match (state, self.control_click) {
                         (ElementState::Pressed, true) => rt.secondary_down(x, y),
                         (ElementState::Released, true) => rt.secondary_up(x, y),

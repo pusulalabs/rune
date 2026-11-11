@@ -291,6 +291,7 @@ fn same_gestures(
         (None, None) => true,
         (Some(x), Some(y)) => {
             x.buttons == y.buttons
+                && x.control_click == y.control_click
                 && opt_rc_eq(&x.wheel, &y.wheel)
                 && opt_rc_eq(&x.magnify, &y.magnify)
                 && opt_rc_eq(&x.rotate, &y.rotate)
