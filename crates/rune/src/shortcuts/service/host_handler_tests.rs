@@ -208,3 +208,76 @@ fn a_refused_handler_drops_after_the_handler_lock_so_routing_can_proceed() {
     routed.join().unwrap();
     drop(guard);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bind_holding_an_engine_a_close_took_is_refused() {
+    let app = app("Taken");
+    // A's close takes routing; B attaches; a call already holds B's engine when A's close takes it.
+    let mut first = std::mem::ManuallyDrop::new(Guard::attach(&app.shared, Arc::new(|| {}), true, false));
+    let latest = first.close_routing();
+    let second = Guard::attach(&app.shared, Arc::new(|| {}), true, false);
+    let held = app.shared.shortcuts.control.engine.lock().unwrap().clone().unwrap();
+    first.finish_close(latest);
+    assert_eq!(held.lock().unwrap().register(ShortcutId(u32::MAX - 3), chord("ctrl+alt+t")), Err(ShortcutError::NotRunning));
+    assert!(held.lock().unwrap().bindings.ids().is_empty(), "nothing bound on the taken engine");
+    drop(second);
+}
+
+/// Blocks a caller in its wake until `resume`, after saying so on `entered`.
+#[cfg(not(target_os = "linux"))]
+fn pausing_wake() -> (Waker, mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (entered_tx, entered) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let (entered_tx, resumed) = (Mutex::new(entered_tx), Mutex::new(resumed));
+    let wake: Waker = Arc::new(move || {
+        entered_tx.lock().unwrap().send(()).unwrap();
+        let _ = resumed.lock().unwrap().recv();
+    });
+    (wake, entered, resume)
+}
+
+// On Linux nothing queues for the owner.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_close_drops_the_handler_of_a_call_it_canceled() {
+    let app = app("Canceled");
+    let (wake, entered, resume) = pausing_wake();
+    let guard = Guard::attach(&app.shared, wake, true, false);
+    let probe = Arc::new(());
+    let weak = Arc::downgrade(&probe);
+    let caller = {
+        let handle = app.handle();
+        std::thread::spawn(move || handle.register_shortcut(chord("ctrl+alt+c"), move |_, _| { let _ = &probe; }))
+    };
+    // The call is queued for the owner, and its caller is stopped in the wake, before its reply.
+    entered.recv().unwrap();
+    drop(guard);
+    let alive = weak.upgrade().is_some();
+    resume.send(()).unwrap();
+    assert_eq!(caller.join().unwrap(), Err(ShortcutError::NotRunning));
+    assert!(!alive, "the canceled call's handler went by the time the close returned");
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn an_unregister_from_another_thread_drops_the_handler_on_the_owner() {
+    struct RecordsThread(Arc<Mutex<Option<std::thread::ThreadId>>>);
+    impl Drop for RecordsThread {
+        fn drop(&mut self) { *self.0.lock().unwrap() = Some(std::thread::current().id()); }
+    }
+    let app = app("Owner");
+    let (woke_tx, woke) = mpsc::channel();
+    let woke_tx = Mutex::new(woke_tx);
+    let guard = Guard::attach(&app.shared, Arc::new(move || { let _ = woke_tx.lock().unwrap().send(()); }), true, false);
+    let dropped_on = Arc::new(Mutex::new(None));
+    let probe = RecordsThread(dropped_on.clone());
+    let id = app.handle().register_shortcut(chord("ctrl+alt+o"), move |_, _| { let _ = &probe; }).unwrap();
+    while woke.try_recv().is_ok() {}
+    let caller = { let handle = app.handle(); std::thread::spawn(move || handle.unregister_shortcut(id)) };
+    woke.recv().unwrap();
+    guard.drain();
+    assert_eq!(caller.join().unwrap(), Ok(()));
+    assert_eq!(*dropped_on.lock().unwrap(), Some(std::thread::current().id()), "the capture dropped on the owner, which ran the call");
+    drop(guard);
+}

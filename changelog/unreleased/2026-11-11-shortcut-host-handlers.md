@@ -5,4 +5,6 @@
   replaced, plus those of whatever registrations the engine it let go of held. A later host's
   other handlers stay, as do those of registrations no host has taken yet. A removed handler is
   now dropped after the locks around it are released, so a handler whose captures call back
-  into the App can't deadlock a registration.
+  into the App can't deadlock a registration. On Linux a registration that reaches an engine
+  after a close has taken it now fails with `NotRunning`, where it used to return an id whose
+  handler was already gone.

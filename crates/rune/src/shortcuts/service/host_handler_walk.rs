@@ -25,6 +25,8 @@ const KEPT_EARLIER: &str = "a cleanup kept a handler routed before its close too
 const KEPT_RELEASED: &str = "a cleanup kept the handler of a registration its close released";
 const LOST_LIVE: &str = "the attached host's engine holds a registration with no handler";
 const LEAKED: &str = "a handler outlived both hosts";
+const KEEPS_LATER: &str = "a cleanup kept a later host's handlers";
+const REFUSED_CLOSED: &str = "a bind reaching an engine a close took was refused";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Side { Dev, Reference, New }
@@ -84,6 +86,11 @@ struct World {
     result: Option<Result<(), ShortcutError>>,
     /// Another call inside this engine, holding its lock.
     busy: Option<usize>,
+    /// A host thread in the middle of the registration's call, which can do nothing else until
+    /// the call returns.
+    occupied: Option<usize>,
+    /// The marked departure this event took, if any.
+    departure: Option<&'static str>,
     fired: BTreeSet<u32>,
     broken: Vec<&'static str>,
     /// What the last cleanup kept, and what keeping only the registrations neither routed before
@@ -103,7 +110,8 @@ impl Clone for World {
         World {
             side: self.side, linux: self.linux, lives: self.lives, engines: self.engines.clone(), slot: self.slot, locals: self.locals,
             attachment, hosts: self.hosts, ids: self.ids.clone(), table: self.table.clone(), routed_after: self.routed_after.clone(),
-            closes: self.closes, call: self.call, id: self.id, result: self.result.clone(), busy: self.busy, fired: self.fired.clone(),
+            closes: self.closes, call: self.call, id: self.id, result: self.result.clone(), busy: self.busy, occupied: self.occupied,
+            departure: self.departure, fired: self.fired.clone(),
             broken: self.broken.clone(), kept: self.kept.clone(), released_later: self.released_later,
         }
     }
@@ -121,7 +129,7 @@ impl World {
         let mut world = World {
             side, linux, lives: [Life::Unborn; 2], engines: vec![], slot: None, locals: [None; 2], attachment: Attachment::Detached,
             hosts: HostIds::default(), ids: BTreeSet::new(), table: Handlers::default(), routed_after: BTreeMap::new(), closes: 0,
-            call: Phase::Idle, id: 0, result: None, busy: None, fired: BTreeSet::new(), broken: vec![], kept: None, released_later: false,
+            call: Phase::Idle, id: 0, result: None, busy: None, occupied: None, departure: None, fired: BTreeSet::new(), broken: vec![], kept: None, released_later: false,
         };
         world.install(A);
         world.attach(A);
@@ -178,13 +186,17 @@ impl World {
     }
 
     fn close_routing(&mut self, host: usize) {
-        self.closes += 1;
         let jobs = match step_attachment(&mut self.attachment, AttachEvent::Close).into_iter().next() {
             Some(AttachEffect::Release(jobs)) => jobs,
             _ => vec![],
         };
         // The close drops a queued caller's reply sender; the caller wakes to NotRunning later.
-        if self.call == Phase::Queued && jobs.contains(&self.id) { self.call = Phase::LetGo; }
+        // The canceled call was the closing host's, routed before this close.
+        if self.call == Phase::Queued && jobs.contains(&self.id) {
+            self.mark_routed();
+            self.call = Phase::LetGo;
+        }
+        self.closes += 1;
         self.lives[host] = Life::Closing { epoch: self.closes, latest: self.hosts.latest(), taken: None };
     }
 
@@ -231,7 +243,8 @@ impl World {
         if after.iter().any(routed_before) { self.broken.push(KEPT_EARLIER); }
         if after.iter().any(|id| in_mask(released, *id)) { self.broken.push(KEPT_RELEASED); }
         if before.iter().any(|id| in_mask(released, *id) && !routed_before(id)) { self.released_later = true; }
-        let expected = before.iter().copied().filter(|id| !ends(id)).collect();
+        let expected: BTreeSet<u32> = before.iter().copied().filter(|id| !ends(id)).collect();
+        if !expected.is_empty() { self.departure = Some(KEEPS_LATER); }
         self.kept = Some((after, expected));
         self.lives[host] = Life::Closed;
     }
@@ -244,6 +257,7 @@ impl World {
     }
 
     fn refuse(&mut self) {
+        self.occupied = None;
         self.remove_handler(self.id);
         self.call = Phase::Idle;
         self.result = Some(Err(ShortcutError::NotRunning));
@@ -272,7 +286,7 @@ impl World {
             return;
         }
         let run = match step_attachment(&mut self.attachment, AttachEvent::Call { from: THREADS[from], shared: false }).into_iter().next() {
-            Some(AttachEffect::Run { .. }) => from,
+            Some(AttachEffect::Run { .. }) => { self.occupied = (from != OTHER).then_some(from); from }
             Some(AttachEffect::Wait) => {
                 step_attachment(&mut self.attachment, AttachEvent::Post(self.id));
                 self.call = Phase::Queued;
@@ -293,6 +307,7 @@ impl World {
             _ => vec![],
         };
         if self.call != Phase::Queued || !jobs.contains(&self.id) { return; }
+        self.occupied = Some(host);
         self.mark_routed();
         match self.locals[host] {
             Some(engine) => self.call = Phase::Routed { engine, locked: false },
@@ -302,6 +317,14 @@ impl World {
 
     fn run(&mut self) {
         let Phase::Routed { engine, .. } = self.call else { unreachable!() };
+        // Only a Linux close releases an engine a call can still reach.
+        if self.side != Side::Dev && self.engines[engine].released {
+            // differs from dev: a bind reaching an engine a close took is refused, where dev bound
+            // it there and returned Ok with its handler already gone.
+            self.departure = Some(REFUSED_CLOSED);
+            return self.refuse();
+        }
+        self.occupied = None;
         self.engines[engine].held.insert(self.id);
         self.call = Phase::Idle;
         self.result = Some(Ok(()));
@@ -335,7 +358,10 @@ impl World {
     /// Returns whether the letter did anything.
     fn play(&mut self, letter: usize) -> bool {
         self.kept = None;
+        self.departure = None;
         let host = if (2..5).contains(&letter) || letter == 12 { A } else { B };
+        // A host's own letters wait while its thread is busy in the registration's call.
+        if matches!(letter, 0..=7 | 12 | 13) && self.occupied == Some(host) { return false; }
         let moved = match letter {
             // An install waiting for the slot's lock holds nothing, so it simply comes later.
             0 if self.lives[B] == Life::Unborn && !self.slot_held() => { self.install(B); true }
@@ -385,7 +411,7 @@ fn without_handlers(view: View) -> View {
     (call, result, lives, owner, jobs, live, busy, vec![], vec![])
 }
 
-struct Walk { found: BTreeSet<&'static str>, departures: usize, released_later: bool }
+struct Walk { found: BTreeSet<&'static str>, departures: BTreeSet<&'static str>, released_later: bool }
 
 fn walk(sides: &[World; 3], departed: bool, sequence: &mut Vec<usize>, depth: usize, out: &mut Walk) {
     for letter in 0..17 {
@@ -403,14 +429,28 @@ fn walk(sides: &[World; 3], departed: bool, sequence: &mut Vec<usize>, depth: us
         assert_eq!(new.view(), reference.view(), "{}", at());
         let mut now_departed = departed;
         if !departed && dev.view() != reference.view() {
-            // differs from dev: only a cleanup, keeping what neither was routed before its close
-            // took routing nor was released by it, where dev kept nothing.
-            assert_eq!(without_handlers(dev.view()), without_handlers(reference.view()), "{}", at());
-            let (kept, expected) = reference.kept.clone().unwrap_or_else(|| panic!("the first difference isn't a cleanup: {}", at()));
-            assert!(dev.kept.as_ref().is_some_and(|(kept, _)| kept.is_empty()), "{}", at());
-            assert!(!kept.is_empty() && kept == expected, "{}: kept {kept:?}, expected {expected:?}", at());
+            // differs from dev: only at one of the two marked departures.
+            match reference.departure {
+                Some(KEEPS_LATER) => {
+                    // A cleanup keeps what was neither routed before its close took routing nor
+                    // released by it, where dev kept nothing.
+                    assert_eq!(without_handlers(dev.view()), without_handlers(reference.view()), "{}", at());
+                    let (kept, expected) = reference.kept.clone().unwrap();
+                    assert!(dev.kept.as_ref().is_some_and(|(kept, _)| kept.is_empty()), "{}", at());
+                    assert!(!kept.is_empty() && kept == expected, "{}: kept {kept:?}, expected {expected:?}", at());
+                }
+                Some(REFUSED_CLOSED) => {
+                    // The bind is refused, and its handler goes, where dev returned Ok.
+                    assert_eq!((dev.result.clone(), reference.result.clone()), (Some(Ok(())), Some(Err(ShortcutError::NotRunning))), "{}", at());
+                    let (_, _, lives, owner, jobs, live, busy, _, _) = reference.view();
+                    let (_, _, dev_lives, dev_owner, dev_jobs, dev_live, dev_busy, _, _) = dev.view();
+                    assert_eq!((lives, owner, jobs, live, busy), (dev_lives, dev_owner, dev_jobs, dev_live, dev_busy), "{}", at());
+                    assert!(!reference.has_handler(reference.id), "{}", at());
+                }
+                _ => panic!("dev and the reference differ outside a marked departure: {}", at()),
+            }
             now_departed = true;
-            out.departures += 1;
+            out.departures.extend(reference.departure);
         }
         if sequence.len() < depth { walk(&next, now_departed, sequence, depth, out); }
         sequence.pop();
@@ -421,12 +461,21 @@ fn walk(sides: &[World; 3], departed: bool, sequence: &mut Vec<usize>, depth: us
 fn every_interleaving_keeps_handlers_with_the_hosts_that_took_them() {
     for linux in [true, false] {
         let sides = [Side::Dev, Side::Reference, Side::New].map(|side| World::new(side, linux));
-        let mut out = Walk { found: BTreeSet::new(), departures: 0, released_later: false };
+        let mut out = Walk { found: BTreeSet::new(), departures: BTreeSet::new(), released_later: false };
         walk(&sides, false, &mut vec![], 8, &mut out);
         for invariant in [DROPPED_LATER, LOST_LIVE] {
             assert!(out.found.contains(invariant), "linux {linux}: the walk never saw dev break this, so it proves nothing: {invariant}");
         }
-        assert!(out.departures > 0, "linux {linux}: the marked departure never took effect");
+        assert!(out.departures.contains(KEEPS_LATER), "linux {linux}: the kept-handlers departure never took effect");
+        if linux {
+            // From A's close taking routing, B attaching and a call entering B's engine, deep
+            // enough for a close to take that engine while a registration waits for it.
+            let mut sides = sides.clone();
+            let prefix = vec![2, 0, 1, 14];
+            for letter in &prefix { assert!(sides.each_mut().map(|world| world.play(*letter)).iter().all(|moved| *moved)); }
+            walk(&sides, false, &mut prefix.clone(), prefix.len() + 7, &mut out);
+            assert!(out.departures.contains(REFUSED_CLOSED), "the refused-bind departure never took effect");
+        }
         if linux { assert!(out.released_later, "the walk never had a close release a later host's registration"); }
     }
 }
@@ -480,4 +529,29 @@ fn a_caller_let_go_by_a_close_finishes_after_it() {
         assert_eq!((world.call, world.result.clone()), (Phase::Idle, Some(Err(ShortcutError::NotRunning))), "{side:?}");
         assert!(!world.has_handler(1), "{side:?}");
     }
+}
+
+#[test]
+fn a_host_busy_in_its_own_call_cannot_close_or_drain_until_it_returns() {
+    for side in [Side::Dev, Side::New] {
+        let mut world = World::new(side, false);
+        // A registers on its own thread, so the call runs on A's stack.
+        assert!(world.play(8) && world.play(10));
+        assert_eq!(world.occupied, Some(A));
+        assert!(!world.play(2) && !world.play(12), "{side:?}: A can't close or drain mid-call");
+        assert!(world.play(0) && world.play(1), "{side:?}: B can still install and attach");
+        assert!(world.play(11) && world.play(2), "{side:?}: once the call returns, A can close");
+    }
+}
+
+#[test]
+fn a_bind_reaching_an_engine_a_close_took_is_refused() {
+    let mut world = World::new(Side::New, true);
+    // A's close takes routing; B attaches; a call is inside B's engine and a registration parks
+    // behind it; A's close takes B's engine and releases it first.
+    for letter in [2, 0, 1, 14, 8, 9] { assert!(world.play(letter)); }
+    assert_eq!(world.call, Phase::Parked(1));
+    for letter in [3, 15, 3, 16, 11] { assert!(world.play(letter), "{letter}"); }
+    assert_eq!(world.result, Some(Err(ShortcutError::NotRunning)));
+    assert!(!world.has_handler(1), "its handler went with it");
 }

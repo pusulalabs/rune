@@ -79,10 +79,15 @@ struct Engine {
     sink: Sink,
     connect: Connect,
     bindings: Bindings<NativeBackend>,
+    /// A close took this engine. A call that reached it anyway must not bind here.
+    closed: bool,
 }
 
 impl Engine {
     fn register(&mut self, id: ShortcutId, shortcut: Shortcut) -> Result<(), ShortcutError> {
+        // differs from dev: a call holding an engine a close took used to bind there and succeed,
+        // with its handler already gone. Its close has run, so it is refused instead.
+        if self.closed { return Err(ShortcutError::NotRunning); }
         // Another App in this process holds it; some backends (the portal) wouldn't refuse.
         let claimed = !matches!(self.bindings, Bindings::Virtual(_)) && NATIVE.lock().unwrap().iter().any(|(_, s, _)| s == &shortcut);
         self.apply(BindEvent::Register { id, shortcut, claimed })
@@ -229,10 +234,10 @@ impl<S: 'static> Hub<S> {
         self.control.invoke(move |engine| {
             engine.unregister(id)?;
             let removed = handlers.lock().unwrap().remove(id);
-            Ok(removed)
+            // On the thread running the call, but after the handler lock.
+            drop(removed);
+            Ok(())
         })
-        // Dropped outside the engine and handler locks, since its captures may take either.
-        .map(drop)
     }
 
     pub(super) fn errors(&self) -> Vec<ShortcutError> { std::mem::take(&mut self.errors.lock().unwrap()) }
@@ -288,7 +293,7 @@ impl Guard {
         let control = shared.shortcuts.control.clone();
         let title = shared.shortcuts.title.get().copied().unwrap_or_default();
         let bindings = if headless { Bindings::Virtual(HashMap::new()) } else { Bindings::Disconnected };
-        let engine = Engine { title, wayland, sink, connect, bindings };
+        let engine = Engine { title, wayland, sink, connect, bindings, closed: false };
         #[cfg(not(target_os = "linux"))]
         ENGINES.with(|engines| engines.borrow_mut().insert(control.key, Rc::new(RefCell::new(engine))));
         // A replaced engine closes with the slot locked, so callers wait until its chords are free.
@@ -339,8 +344,15 @@ impl Guard {
             let mut route = self.control.attachment.lock().unwrap();
             (step_attachment(&mut route.state, AttachEvent::Close), route.hosts.latest())
         };
-        // Dropping queued reply senders releases waiting callers with NotRunning.
-        for effect in effects { if let AttachEffect::Release(jobs) = effect { drop(jobs); } }
+        // Dropping queued reply senders releases waiting callers with NotRunning. A canceled call
+        // was the closing host's, so its handler goes with this close.
+        for effect in effects {
+            let AttachEffect::Release(jobs) = effect else { continue };
+            #[cfg(not(target_os = "linux"))]
+            for job in jobs { (job.routed)(latest); }
+            #[cfg(target_os = "linux")]
+            drop(jobs);
+        }
         latest
     }
 
@@ -358,6 +370,7 @@ impl Guard {
         #[cfg(target_os = "linux")]
         if let Some(engine) = self.control.engine.lock().unwrap().take() {
             let mut engine = engine.lock().unwrap();
+            engine.closed = true;
             released = engine.bindings.ids();
             engine.release();
         }
@@ -396,7 +409,7 @@ mod tests {
         }
         for error in [ShortcutError::Conflict, ShortcutError::Unsupported, ShortcutError::PermissionDenied, ShortcutError::Backend("disconnected".into())] {
             let bindings = Bindings::Connected { native: Box::new(Mock(error.clone())) as NativeBackend, registrations: HashMap::new() };
-            let mut engine = Engine { title: "mock", wayland: false, sink: Arc::new(|_, _| {}), connect: super::super::backend, bindings };
+            let mut engine = Engine { title: "mock", wayland: false, sink: Arc::new(|_, _| {}), connect: super::super::backend, bindings, closed: false };
             assert_eq!(engine.register(ShortcutId(1), "ctrl+a".parse().unwrap()), Err(error));
             assert!(matches!(engine.bindings, Bindings::Disconnected));
         }
@@ -413,7 +426,7 @@ mod tests {
             fn unregister(&mut self, _: ShortcutId) -> Result<(), ShortcutError> { Ok(()) }
         }
         let chord: Shortcut = "ctrl+alt+shift+f17".parse().unwrap();
-        let native = |title| Engine { title, wayland: false, sink: Arc::new(|_, _| {}), connect: super::super::backend, bindings: Bindings::Connected { native: Box::new(Accept) as NativeBackend, registrations: HashMap::new() } };
+        let native = |title| Engine { title, wayland: false, sink: Arc::new(|_, _| {}), connect: super::super::backend, bindings: Bindings::Connected { native: Box::new(Accept) as NativeBackend, registrations: HashMap::new() }, closed: false };
         let (mut first, mut second) = (native("First"), native("Second"));
         first.register(ShortcutId(u32::MAX - 1), chord.clone()).unwrap();
         assert_eq!(second.register(ShortcutId(u32::MAX - 2), chord.clone()), Err(ShortcutError::Conflict),

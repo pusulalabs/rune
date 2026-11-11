@@ -439,7 +439,7 @@ fn new_engine(title: &'static str, start: Start) -> Engine {
         Start::NoBackend => Bindings::Disconnected,
         Start::EmptyBackend => Bindings::Connected { native: Box::new(Scripted(Side::New)) as NativeBackend, registrations: HashMap::new() },
     };
-    Engine { title, wayland: true, sink: Arc::new(|_, _| {}), connect: connect_new, bindings }
+    Engine { title, wayland: true, sink: Arc::new(|_, _| {}), connect: connect_new, bindings, closed: false }
 }
 
 /// Whether a backend is connected, and the sorted registrations.
