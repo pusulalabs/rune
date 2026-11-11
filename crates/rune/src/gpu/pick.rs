@@ -20,6 +20,11 @@
 //! (`low`, `high` or `none`) override the choice. Without them, and without a compositor device
 //! or a display's GPU to match, Rune takes the lowest-power adapter. `RUNE_GPU_LOG=1` prints the choice and its
 //! reason; a machine with more than one GPU prints it anyway, once per process.
+//!
+//! An app states its own preference with `prefer_gpu`, which the environment still overrides.
+//! It replaces the lowest-power fallback, and high performance also takes a discrete GPU over a
+//! compositor's or a display's GPU that isn't one (`faster`): a hybrid laptop then draws on its
+//! discrete GPU and the system presents across to the panel, as it does for a game.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
@@ -27,6 +32,8 @@ pub(crate) enum Reason {
     EnvPower,
     Compositor,
     Display,
+    /// The app's `prefer_gpu`.
+    App(wgpu::PowerPreference),
     LowPower,
 }
 
@@ -37,6 +44,9 @@ impl Reason {
             Reason::EnvPower => "WGPU_POWER_PREF",
             Reason::Compositor => "the compositor's GPU",
             Reason::Display => "the GPU driving the primary display",
+            Reason::App(wgpu::PowerPreference::HighPerformance) => "the app prefers high performance",
+            Reason::App(wgpu::PowerPreference::LowPower) => "the app prefers low power",
+            Reason::App(wgpu::PowerPreference::None) => "the app has no power preference",
             Reason::LowPower => "lowest power",
         }
     }
@@ -77,6 +87,7 @@ fn shows(compositor: Option<&str>, pci: &str) -> bool {
 pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, presented: bool) -> Result<Pick, String> {
     let usable = |adapter: &wgpu::Adapter| surface.is_none_or(|s| adapter.is_surface_supported(s));
     let compositor = compositor_pci();
+    let preferred = crate::gpu::backend::preferred();
     let mut enumerated = None;
     if let Ok(name) = std::env::var("WGPU_ADAPTER_NAME") {
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
@@ -97,8 +108,9 @@ pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>
         let infos: Vec<_> = adapters.iter().map(|a| (a.get_info(), usable(a))).collect();
         enumerated = Some(infos.iter().filter(|(info, _)| info.device_type != wgpu::DeviceType::Cpu).count());
         if let Some(index) = by_pci(pci, &infos) {
+            let (index, reason) = faster(preferred, index, &infos).unwrap_or((index, Reason::Compositor));
             let adapter = adapters.into_iter().nth(index).expect("index from this list");
-            return Ok(log(Pick { adapter, reason: Reason::Compositor, compositor }, enumerated));
+            return Ok(log(Pick { adapter, reason, compositor }, enumerated));
         }
     }
     // Only a surface is presented; offscreen work (tests, snapshots) keeps the lowest-power GPU.
@@ -108,12 +120,31 @@ pub(crate) fn pick(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>
         let infos: Vec<_> = adapters.iter().map(|a| (a.get_info(), usable(a))).collect();
         enumerated = Some(infos.iter().filter(|(info, _)| info.device_type != wgpu::DeviceType::Cpu).count());
         if let Some(index) = by_display(&displays, &infos) {
+            let (index, reason) = faster(preferred, index, &infos).unwrap_or((index, Reason::Display));
             let adapter = adapters.into_iter().nth(index).expect("index from this list");
-            return Ok(log(Pick { adapter, reason: Reason::Display, compositor }, enumerated));
+            return Ok(log(Pick { adapter, reason, compositor }, enumerated));
         }
     }
-    let adapter = request(instance, surface, wgpu::PowerPreference::LowPower)?;
-    Ok(log(Pick { adapter, reason: Reason::LowPower, compositor }, enumerated))
+    let (power, reason) = fallback(preferred);
+    let adapter = request(instance, surface, power)?;
+    Ok(log(Pick { adapter, reason, compositor }, enumerated))
+}
+
+/// What the adapter request asks for when nothing else chose: the app's preference
+/// (`prefer_gpu`), else the lowest power.
+fn fallback(preferred: Option<wgpu::PowerPreference>) -> (wgpu::PowerPreference, Reason) {
+    preferred.map_or((wgpu::PowerPreference::LowPower, Reason::LowPower), |power| (power, Reason::App(power)))
+}
+
+/// The usable discrete GPU that draws in place of `picked`, the compositor's or the display's
+/// adapter, for an app that prefers high performance (`prefer_gpu`), Vulkan first: none when
+/// `picked` is discrete itself, or the app prefers anything else.
+fn faster(preferred: Option<wgpu::PowerPreference>, picked: usize, adapters: &[(wgpu::AdapterInfo, bool)]) -> Option<(usize, Reason)> {
+    let power = preferred.filter(|power| *power == wgpu::PowerPreference::HighPerformance)?;
+    if adapters.get(picked)?.0.device_type == wgpu::DeviceType::DiscreteGpu { return None; }
+    let discrete = |(info, usable): &(wgpu::AdapterInfo, bool)| *usable && info.device_type == wgpu::DeviceType::DiscreteGpu;
+    let index = adapters.iter().position(|a| discrete(a) && a.0.backend == wgpu::Backend::Vulkan).or_else(|| adapters.iter().position(discrete))?;
+    Some((index, Reason::App(power)))
 }
 
 fn request(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, power_preference: wgpu::PowerPreference) -> Result<wgpu::Adapter, String> {

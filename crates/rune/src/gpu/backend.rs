@@ -50,6 +50,29 @@ pub(crate) fn choose(backend: GpuBackend) {
     }
 }
 
+/// What the app prefers (`prefer_gpu`), when it said.
+static PREFERRED: std::sync::Mutex<Option<wgpu::PowerPreference>> = std::sync::Mutex::new(None);
+
+/// Picks the GPU by `power` from now on, process-wide, where Rune would take the lowest-power
+/// adapter: `HighPerformance` puts a CAD or 3D app on a dual-GPU laptop's discrete GPU. It
+/// also outranks the two rules that pick by where a window shows, when they would pick a GPU
+/// that isn't discrete and a discrete one can present to the window: on Windows the GPU
+/// driving the primary display, on Wayland the compositor's GPU. A transparent window still
+/// gets a GPU that composites its translucent pixels. `LowPower` and `None` only replace the
+/// fallback, as wgpu's adapter request reads them. `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`
+/// override it. Call it first in `main`, before `prewarm_gpu` and before the app runs: a
+/// device already made keeps its GPU. `RUNE_GPU_LOG=1` prints the GPU chosen and why. Native
+/// windows, overlays and headless runs only.
+pub fn prefer_gpu(power: wgpu::PowerPreference) {
+    *PREFERRED.lock().unwrap_or_else(|e| e.into_inner()) = Some(power);
+}
+
+/// The app's `prefer_gpu`, for `pick`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn preferred() -> Option<wgpu::PowerPreference> {
+    *PREFERRED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn chosen() -> Option<GpuBackend> {
     match CHOSEN.load(Ordering::Relaxed) {
         WGPU => Some(GpuBackend::Wgpu),

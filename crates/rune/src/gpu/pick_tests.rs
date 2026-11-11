@@ -1,4 +1,4 @@
-use super::{by_display, by_name, by_pci, dev_numbers, pci_address, pci_ids, power_rank, shows};
+use super::{Reason, by_display, by_name, by_pci, dev_numbers, faster, fallback, pci_address, pci_ids, power_rank, shows};
 use std::path::Path;
 
 fn adapter(name: &str, backend: wgpu::Backend, pci: &str) -> wgpu::AdapterInfo {
@@ -104,4 +104,42 @@ fn the_gpu_driving_the_primary_display_is_picked() {
     assert_eq!(by_display(&[(0x8086, 0x56a0)], &adapters), None, "no adapter drives it");
     let cant_present = [(adapters[0].0.clone(), false), adapters[1].clone()];
     assert_eq!(by_display(&[(0x10de, 0x2c05)], &cant_present), None);
+}
+
+/// An app that prefers high performance draws on the discrete GPU of a hybrid laptop whose panel
+/// (Windows) or compositor (Wayland) is on the integrated one; any other preference, or none,
+/// leaves the display's or the compositor's GPU.
+#[test]
+fn a_high_performance_app_takes_a_discrete_gpu_over_the_displays_integrated_one() {
+    use wgpu::DeviceType::*;
+    use wgpu::PowerPreference::{HighPerformance, LowPower};
+    let high = Some((0, Reason::App(HighPerformance)));
+    let adapters = [
+        (gpu("NVIDIA GeForce RTX 5070 Ti", DiscreteGpu, 0x10de, 0x2c05), true),
+        (gpu("AMD Radeon(TM) Graphics", IntegratedGpu, 0x1002, 0x13c0), true),
+        (gpu("Microsoft Basic Render Driver", Cpu, 0x1414, 0x8c), true),
+    ];
+    assert_eq!(faster(Some(HighPerformance), 1, &adapters), high);
+    assert_eq!(faster(Some(HighPerformance), 0, &adapters), None, "the display's GPU is the discrete one already");
+    assert_eq!(faster(Some(LowPower), 1, &adapters), None);
+    assert_eq!(faster(Some(wgpu::PowerPreference::None), 1, &adapters), None);
+    assert_eq!(faster(None, 1, &adapters), None, "an app that said nothing keeps the display's GPU");
+    let cant_present = [(adapters[0].0.clone(), false), adapters[1].clone()];
+    assert_eq!(faster(Some(HighPerformance), 1, &cant_present), None, "never a GPU that can't present to the window");
+    let two_backends = [
+        (adapter("Intel(R) Graphics (ADL GT2)", wgpu::Backend::Vulkan, "0000:00:02.0"), true),
+        (wgpu::AdapterInfo { device_type: DiscreteGpu, ..adapter("NVIDIA GeForce RTX 5070", wgpu::Backend::Gl, "0000:01:00.0") }, true),
+        (wgpu::AdapterInfo { device_type: DiscreteGpu, ..adapter("NVIDIA GeForce RTX 5070", wgpu::Backend::Vulkan, "0000:01:00.0") }, true),
+    ];
+    assert_eq!(faster(Some(HighPerformance), 0, &two_backends), Some((2, Reason::App(HighPerformance))), "Vulkan before GL");
+}
+
+/// With nothing else to go by, the adapter request asks for what the app prefers, else low power.
+#[test]
+fn the_apps_preference_replaces_the_low_power_fallback() {
+    use wgpu::PowerPreference::{HighPerformance, LowPower};
+    assert_eq!(fallback(None), (LowPower, Reason::LowPower));
+    assert_eq!(fallback(Some(HighPerformance)), (HighPerformance, Reason::App(HighPerformance)));
+    assert_eq!(fallback(Some(LowPower)), (LowPower, Reason::App(LowPower)));
+    assert_eq!(fallback(Some(wgpu::PowerPreference::None)), (wgpu::PowerPreference::None, Reason::App(wgpu::PowerPreference::None)));
 }
